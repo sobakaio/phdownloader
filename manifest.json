@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "PHDownloader",
+  "version": "1.2.2",
+  "description": "Download premium PH videos while logged in \u2014 quality picker (720p and up, highest direct preselected) and the native Save-as dialog.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "downloads",
+    "storage",
+    "alarms",
+    "offscreen",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.pornhubpremium.com/view_video.php*",
+        "https://*.pornhubpremium.com/video/show*",
+        "https://*.pornhubpremium.com/embed/*",
+        "https://*.pornhub.com/view_video.php*",
+        "https://*.pornhub.com/video/show*",
+        "https://*.pornhub.com/embed/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "PHDownloader",
+    "default_popup": "popup.html"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
