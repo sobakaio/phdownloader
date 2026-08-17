@@ -5,17 +5,20 @@
   if (window.__phpdLoaded) return;
   window.__phpdLoaded = true;
 
-  const MSG = { GET_INFO: 'PHD:GET_INFO', DOWNLOAD: 'PHD:DOWNLOAD', CANCEL: 'PHD:CANCEL', SET_HOST: 'PHD:SET_HOST', EVENT: 'PHD:EVENT' };
+  const MSG = { GET_INFO: 'PHD:GET_INFO', DOWNLOAD: 'PHD:DOWNLOAD', CANCEL: 'PHD:CANCEL', SET_HOST: 'PHD:SET_HOST', EVENT: 'PHD:EVENT', GET_QUEUE: 'PHD:GET_QUEUE', RESTART: 'PHD:RESTART', DELETE_JOB: 'PHD:DELETE_JOB', CLEAR_QUEUE: 'PHD:CLEAR_QUEUE' };
+  const QUEUE_TERMINAL = new Set(['complete', 'error', 'cancelled']);
   const host = location.hostname.endsWith('pornhubpremium.com') ? 'pornhubpremium.com' : 'pornhub.com';
   const isVideoPage = /view_video\.php|video\/show|\/embed\//.test(location.pathname + location.search);
 
   const state = {
-    settings: { filenameTemplate: '{title} - {quality}', autoShowPanel: true },
+    settings: { filenameTemplate: '{title} - {quality}', autoShowPanel: true, saveAs: true },
     info: null,          // {ok,title,duration,formats,notes,error}
-    jobId: null,
+    jobId: null,         // the job THIS tab started (drives the main status area)
     jobState: 'idle',    // idle|working|assembling|downloading|complete|error|cancelled
     received: 0, total: null, progress: null, error: null, part: null, partsTotal: null,
+    queue: {},           // jobId -> job snapshot (all tabs' jobs, synced from the SW)
     panelOpen: false,
+    queueOpen: false,
   };
 
   let root = null;       // shadow root
@@ -51,17 +54,37 @@
     button { flex:1; cursor:pointer; border:none; border-radius:8px; padding:9px 10px; font-size:13px; font-weight:600; }
     .dl { background:#6c5ce7; color:white; } .dl:hover { background:#7d6ef0; } .dl:disabled { opacity:.45; cursor:default; }
     .cancel { background:#2a2a33; color:#e8e8ee; flex:0 0 auto; padding:9px 14px; display:none; }
-    .barwrap { height:8px; background:#0f0f13; border-radius:5px; overflow:hidden; display:none; }
-    .bar { height:100%; width:0%; background:linear-gradient(90deg,#6c5ce7,#a29bfe); transition:width .25s; }
-    .status { color:#8a8a96; font-size:12px; min-height:1.3em; word-break:break-word; }
-    .err { color:#ff7675; }
     .note { color:#fdcb6e; font-size:12px; line-height:1.4; }
     .chk { display:flex; gap:7px; align-items:center; color:#b9b9c4; font-size:12px; cursor:pointer; }
+    .chk input[type=checkbox] { accent-color:#6c5ce7; }
+    .sect { display:flex; align-items:center; justify-content:space-between; padding:7px 12px; cursor:pointer;
+      background:#101016; color:#b9b9c4; font-size:12px; user-select:none; }
+    .sect:hover { color:#e8e8ee; }
+    .sect .chev { color:#6c5ce7; font-size:11px; }
+    .sectblock { display:none; padding:10px 12px; flex-direction:column; gap:9px; background:#101016; }
+    .qrow { display:flex; flex-direction:column; gap:5px; padding:8px; background:#16161d; border:1px solid #2a2a33; border-radius:9px; }
+    .qrow + .qrow { margin-top:6px; }
+    .qtop { display:flex; align-items:center; gap:8px; }
+    .qtitle { flex:1; font-size:12px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .qcancel { cursor:pointer; color:#8a8a96; font-size:13px; padding:0 5px; flex:0 0 auto; }
+    .qcancel:hover { color:#ff7675; }
+    .qbarwrap { height:5px; background:#0f0f13; border-radius:4px; overflow:hidden; }
+    .qbar { height:100%; width:0%; background:linear-gradient(90deg,#6c5ce7,#a29bfe); transition:width .25s; }
+    .qstat { color:#8a8a96; font-size:11px; display:flex; justify-content:space-between; gap:8px; }
+    .qstat .err { color:#ff7675; }
+    .qstat .ok { color:#55efc4; }
+    .qacts { display:flex; align-items:center; gap:10px; }
+    .qclear { cursor:pointer; color:#8a8a96; font-size:11px; padding:2px 7px; border:1px solid #34343f; border-radius:6px; }
+    .qclear:hover { color:#e8e8ee; border-color:#6c5ce7; }
+    .qstat .l { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   `;
 
   function buildUI() {
     const hostEl = document.createElement('div');
-    root = hostEl.attachShadow({ mode: 'closed' });
+    hostEl.id = 'phpd-host';
+    // 'open' shadow root: still fully style-isolated, but reachable from the
+    // page's JS/automation tools (the panel keeps a stable id for that).
+    root = hostEl.attachShadow({ mode: 'open' });
     const style = document.createElement('style');
     style.textContent = CSS;
     root.appendChild(style);
@@ -99,20 +122,96 @@
     el.cancelBtn = document.createElement('button'); el.cancelBtn.className = 'cancel'; el.cancelBtn.textContent = 'Cancel';
     el.btns.append(el.dlBtn, el.cancelBtn);
 
-    el.barwrap = document.createElement('div'); el.barwrap.className = 'barwrap';
-    el.bar = document.createElement('div'); el.bar.className = 'bar';
-    el.barwrap.appendChild(el.bar);
+    // No progress bar or status line in this area: every job has its own
+    // card with bar + status in the queue below (status lives there only).
+    // Page-level problems are folded into the meta line.
 
-    el.status = document.createElement('div'); el.status.className = 'status';
+    // --- Settings (collapsible): filename template, panel, save dialog ---
+    el.settingsHead = document.createElement('div'); el.settingsHead.className = 'sect';
+    el.settingsHead.innerHTML = '<span>⚙ Settings</span><span class="chev">▾</span>';
+    el.settingsBlock = document.createElement('div'); el.settingsBlock.className = 'sectblock';
 
-    body.append(el.titleEl, el.meta, qLabel, el.btns, el.barwrap, el.status);
+    const tLabel = document.createElement('label'); tLabel.className = 'fld';
+    tLabel.append(document.createTextNode('Filename template'));
+    el.templateInput = document.createElement('input'); el.templateInput.type = 'text';
+    el.templateInput.value = state.settings.filenameTemplate;
+    el.templateInput.placeholder = '{title} - {quality}';
+    tLabel.appendChild(el.templateInput);
+
+    const aShow = document.createElement('label'); aShow.className = 'chk';
+    el.autoShowChk = document.createElement('input'); el.autoShowChk.type = 'checkbox';
+    el.autoShowChk.checked = !!state.settings.autoShowPanel;
+    aShow.append(el.autoShowChk, document.createTextNode('Show panel automatically'));
+
+    // 'Ask where to save' — per-download Save As dialog (default ON).
+    // OFF = no dialog, the file goes to Chrome's default downloads folder;
+    // this mode needs Chrome's global "Ask where to save each file"
+    // setting off (otherwise dialog-less saves hang — see background.js).
+    const sAs = document.createElement('label'); sAs.className = 'chk';
+    el.saveAsChk = document.createElement('input'); el.saveAsChk.type = 'checkbox';
+    el.saveAsChk.checked = state.settings.saveAs !== false;
+    sAs.append(el.saveAsChk, document.createTextNode('Ask where to save (Save As dialog)'));
+    sAs.title = 'OFF: save without a dialog to Chrome\u2019s default downloads folder (Chrome\u2019s global \u201cAsk where to save each file\u201d setting must be off for this mode)';
+
+    el.settingsBlock.append(tLabel, aShow, sAs);
+
+    // --- Queue (collapsible): all downloads across tabs ---
+    el.queueHead = document.createElement('div'); el.queueHead.className = 'sect';
+    el.queueCount = document.createElement('span');
+    const ql = document.createElement('span');
+    ql.append(document.createTextNode('⬇ Queue'), el.queueCount);
+    el.clearBtn = document.createElement('span'); el.clearBtn.className = 'qclear';
+    el.clearBtn.textContent = 'Clear finished'; el.clearBtn.style.display = 'none';
+    el.clearBtn.title = 'Remove all done / failed / cancelled entries (active downloads keep running)';
+    const qChev = document.createElement('span'); qChev.className = 'chev'; qChev.textContent = '▾';
+    const qr = document.createElement('span'); qr.className = 'qacts';
+    qr.append(el.clearBtn, qChev);
+    el.queueHead.append(ql, qr);
+    el.queueList = document.createElement('div'); el.queueList.className = 'sectblock';
+    el.clearBtn.addEventListener('click', (e) => { e.stopPropagation(); clearFinished(); });
+
+    body.append(el.titleEl, el.meta, qLabel, el.btns,
+      el.settingsHead, el.settingsBlock, el.queueHead, el.queueList);
     el.panel.append(head, body);
     root.appendChild(el.panel);
 
     el.chip.addEventListener('click', () => setPanelOpen(!state.panelOpen));
     el.dlBtn.addEventListener('click', startDownload);
     el.cancelBtn.addEventListener('click', cancelJob);
+    el.settingsHead.addEventListener('click', () => {
+      const open = el.settingsBlock.style.display !== 'flex';
+      el.settingsBlock.style.display = open ? 'flex' : 'none';
+      el.settingsHead.querySelector('.chev').textContent = open ? '▴' : '▾';
+    });
+    el.queueHead.addEventListener('click', () => {
+      state.queueOpen = !state.queueOpen;
+      renderQueue();
+    });
+    el.templateInput.addEventListener('change', () => {
+      const v = el.templateInput.value.trim() || '{title} - {quality}';
+      el.templateInput.value = v;
+      state.settings.filenameTemplate = v;
+      persistSettings();
+    });
+    el.autoShowChk.addEventListener('change', () => {
+      state.settings.autoShowPanel = el.autoShowChk.checked;
+      persistSettings();
+    });
+    el.saveAsChk.addEventListener('change', () => {
+      state.settings.saveAs = el.saveAsChk.checked;
+      persistSettings();
+    });
     document.documentElement.appendChild(hostEl);
+  }
+
+  function persistSettings() {
+    try {
+      chrome.storage.sync.set({
+        filenameTemplate: state.settings.filenameTemplate,
+        autoShowPanel: !!state.settings.autoShowPanel,
+        saveAs: state.settings.saveAs !== false,
+      });
+    } catch { /* storage unavailable */ }
   }
 
   function fmtBytes(n) {
@@ -132,6 +231,7 @@
     state.panelOpen = open;
     el.panel.style.display = open ? '' : 'none';
     el.chip.textContent = open ? '⬇ Hide panel' : '⬇ Download video';
+    if (open) kickPoll();
   }
 
   function renderInfo() {
@@ -139,15 +239,14 @@
     if (!info) return;
     if (!info.ok) {
       el.titleEl.textContent = 'Could not read this video';
-      el.meta.textContent = '';
+      el.meta.textContent = info.error || 'Unknown error';
       el.quality.innerHTML = '';
-      el.status.className = 'status err';
-      el.status.textContent = info.error || 'Unknown error';
       el.dlBtn.disabled = true;
       return;
     }
     el.titleEl.textContent = info.title || 'Video';
-    el.meta.textContent = [info.duration ? fmtDur(info.duration) : null, `${info.formats.length} formats`].filter(Boolean).join(' · ');
+    el.meta.textContent = [info.duration ? fmtDur(info.duration) : null, `${info.formats.length} formats`,
+      ...(info.notes || [])].filter(Boolean).join(' · ');
     el.quality.innerHTML = '';
     for (const f of info.formats) {
       const opt = document.createElement('option');
@@ -167,35 +266,96 @@
     const recIdx = info.formats.findIndex((f) => f.recommended);
     if (recIdx >= 0) el.quality.value = String(recIdx);
     el.dlBtn.disabled = !info.formats.length;
-    el.status.className = 'status';
-    el.status.textContent = info.notes?.length ? info.notes.join(' ') : '';
   }
 
+  // Job progress/status is rendered ONLY in the queue cards below — this
+  // function just toggles the Cancel button for the local job.
   function renderJob() {
     const s = state.jobState;
     el.cancelBtn.style.display = (s === 'assembling' || s === 'downloading' || s === 'working') ? '' : 'none';
-    if (s === 'idle') { el.barwrap.style.display = 'none'; return; }
-    el.barwrap.style.display = '';
-    const pct = state.progress != null ? Math.round(state.progress * 100) : (s === 'complete' ? 100 : 0);
-    el.bar.style.width = `${pct}%`;
-    if (s === 'working') {
-      el.status.className = 'status';
-      el.status.textContent = 'Starting…';
-    } else if (s === 'assembling') {
-      el.status.className = 'status';
-      const seg = state.partsTotal ? ` · ${state.part || 0}/${state.partsTotal} seg` : '';
-      el.status.textContent = `Assembling… ${fmtBytes(state.received)}${state.total ? ` / ~${fmtBytes(state.total)}` : ''}${seg} (${pct || 0}%)`;
-    } else if (s === 'downloading') {
-      // Blob-to-disk writes report no byte progress; show a flat status.
-      el.status.className = 'status';
-      el.status.textContent = `Saving file… writing to disk${state.total ? ` (${fmtBytes(state.total)})` : ''}`;
-    } else if (s === 'complete') {
-      el.bar.style.width = '100%';
-      el.status.className = 'status';
-      el.status.textContent = '✔ Done — check your downloads.';
-    } else if (s === 'error' || s === 'cancelled') {
-      el.status.className = 'status err';
-      el.status.textContent = state.error || s;
+  }
+  // Download is disabled only while the start of THIS tab's job is pending
+  // (state 'working'). Once the job is running (or failed/done) the button
+  // comes back — a long or stuck save must not disable it forever.
+  // Double-starts of the same video are rejected by the SW (one active job
+  // per videoId), so re-enabling early is safe.
+  function syncDownloadBtn() {
+    el.dlBtn.disabled = state.jobState === 'working' || !state.info?.formats?.length;
+  }
+
+  // Global queue: every job across all tabs (data synced from the SW via
+  // PHD:EVENT broadcasts + PHD:GET_QUEUE polls). Rendered in start order.
+  const QUEUE_ACTIVE = new Set(['working', 'assembling', 'downloading']);
+  function queueStateText(j) {
+    switch (j.state) {
+      case 'working': return 'Starting…';
+      case 'assembling': return j.partsTotal ? `Assembling ${j.part || 0}/${j.partsTotal}` : 'Assembling…';
+      case 'downloading': return 'Saving file…';
+      case 'complete': return '✔ Done';
+      case 'error': return '✖ ' + (j.error || 'Error');
+      case 'cancelled': return 'Cancelled';
+      default: return j.state;
+    }
+  }
+  function renderQueue() {
+    const list = Object.values(state.queue);
+    const activeN = list.filter((j) => QUEUE_ACTIVE.has(j.state)).length;
+    el.queueCount.textContent = list.length ? ` (${activeN ? activeN + ' active · ' : ''}${list.length})` : '';
+    el.clearBtn.style.display = list.some((j) => QUEUE_TERMINAL.has(j.state)) ? '' : 'none';
+    el.queueList.style.display = state.queueOpen && list.length ? 'flex' : 'none';
+    el.queueList.innerHTML = '';
+    for (const j of list) {
+      const row = document.createElement('div'); row.className = 'qrow';
+      row.dataset.jobId = j.jobId;
+
+      const top = document.createElement('div'); top.className = 'qtop';
+      const t = document.createElement('div'); t.className = 'qtitle';
+      t.textContent = j.title || 'Video'; t.title = j.title || '';
+      top.appendChild(t);
+      if (QUEUE_ACTIVE.has(j.state)) {
+        const x = document.createElement('span'); x.className = 'qcancel'; x.textContent = '✕';
+        x.title = 'Cancel this download';
+        x.addEventListener('click', (e) => { e.stopPropagation(); cancelJobById(j.jobId); });
+        top.appendChild(x);
+      } else {
+        // Terminal entries: cancelled ones can be restarted from scratch,
+        // any terminal entry can be removed from the queue.
+        if (j.state === 'cancelled') {
+          const r = document.createElement('span'); r.className = 'qcancel'; r.textContent = '↻';
+          r.title = 'Restart this download (from the beginning)';
+          r.addEventListener('click', (e) => { e.stopPropagation(); restartJobById(j.jobId); });
+          top.appendChild(r);
+        }
+        const d = document.createElement('span'); d.className = 'qcancel'; d.textContent = '✕';
+        d.title = 'Remove from queue';
+        d.addEventListener('click', (e) => { e.stopPropagation(); deleteJobById(j.jobId); });
+        top.appendChild(d);
+      }
+      row.appendChild(top);
+
+      const bw = document.createElement('div'); bw.className = 'qbarwrap';
+      const bar = document.createElement('div'); bar.className = 'qbar';
+      let pct = j.progress != null ? Math.round(j.progress * 100) : 0;
+      if (j.state === 'downloading' || j.state === 'complete') pct = 100;
+      if (j.state === 'error' || j.state === 'cancelled') pct = j.progress != null ? Math.round(j.progress * 100) : 0;
+      bar.style.width = pct + '%';
+      bw.appendChild(bar);
+      row.appendChild(bw);
+
+      const st = document.createElement('div'); st.className = 'qstat';
+      const left = document.createElement('span'); left.className = 'l';
+      left.textContent = [j.quality, queueStateText(j)].filter(Boolean).join(' · ');
+      if (j.state === 'error' || j.state === 'cancelled') left.className = 'l err';
+      else if (j.state === 'complete') left.className = 'l ok';
+      const right = document.createElement('span');
+      if (j.state === 'assembling' && j.total) right.textContent = `${fmtBytes(j.received)} / ${fmtBytes(j.total)} · ${pct}%`;
+      else if (j.state === 'assembling' && j.received) right.textContent = fmtBytes(j.received) + ' · ' + pct + '%';
+      else if (j.state === 'downloading' && j.total) right.textContent = fmtBytes(j.total);
+      else if (j.state === 'complete' && j.total) right.textContent = fmtBytes(j.total);
+      st.append(left, right);
+      row.appendChild(st);
+
+      el.queueList.appendChild(row);
     }
   }
 
@@ -216,35 +376,56 @@
     renderInfo();
   }
 
-  // Fallback for environments where SW -> content-script messages are not
-  // delivered (some automation/CDP setups): poll the SW for job state while a
-  // job is active. Cheap: one small message per second.
+  // Queue sync: the SW is the single source of truth for ALL jobs (any tab).
+  // PHD:EVENT broadcasts give instant low-latency updates; this 1 s poll
+  // reconciles the full queue (jobs started in other tabs, SW restarts, and
+  // jobs the SW has released). One small message per second while the panel
+  // is open — cheap.
   let pollTimer = null;
-  async function pollJob() {
-    if (!state.jobId) { pollTimer = null; return; }
-    const s = state.jobState;
-    if (s !== 'working' && s !== 'assembling' && s !== 'downloading') { pollTimer = null; return; }
+  async function pollQueue() {
+    pollTimer = null;
+    let jobs = null;
     try {
-      const r = await send({ type: 'PHD:GET_JOB', jobId: state.jobId });
-      if (r && r.ok) {
-        if (r.received != null) state.received = r.received;
-        if (r.total != null) state.total = r.total;
-        if (r.progress != null) state.progress = r.progress;
-        if (r.error) state.error = r.error;
-        if (r.part != null) state.part = r.part;
-        if (r.partsTotal != null) state.partsTotal = r.partsTotal;
-        if (r.state === 'assembling' && (s === 'working' || s === 'idle')) state.jobState = 'assembling';
-        else if (r.state === 'downloading' && s !== 'downloading') state.jobState = 'downloading';
-        else if (r.state === 'error') state.jobState = 'error';
-        else if (r.state === 'complete') state.jobState = 'complete';
-        renderJob();
-      }
+      const r = await send({ type: MSG.GET_QUEUE });
+      if (r && r.ok) jobs = r.jobs || [];
     } catch { /* SW busy — retry next tick */ }
-    if (['working', 'assembling', 'downloading'].includes(state.jobState)) {
-      pollTimer = setTimeout(pollJob, 1000);
-    } else {
-      pollTimer = null;
+    if (jobs) {
+      const seen = new Set();
+      for (const j of jobs) {
+        seen.add(j.jobId);
+        state.queue[j.jobId] = { ...(state.queue[j.jobId] || {}), ...j };
+        if (j.jobId === state.jobId) {
+          if (j.received != null) state.received = j.received;
+          if (j.total != null) state.total = j.total;
+          if (j.progress != null) state.progress = j.progress;
+          if (j.error) state.error = j.error;
+          if (j.part != null) state.part = j.part;
+          if (j.partsTotal != null) state.partsTotal = j.partsTotal;
+          const s = state.jobState;
+          if (j.state === 'assembling' && (s === 'working' || s === 'idle')) state.jobState = 'assembling';
+          else if (j.state === 'downloading' && s !== 'downloading') state.jobState = 'downloading';
+          else if (j.state === 'error') state.jobState = 'error';
+          else if (j.state === 'complete') state.jobState = 'complete';
+          else if (j.state === 'cancelled') state.jobState = 'cancelled';
+          if (state.jobState !== s) syncDownloadBtn();
+          renderJob();
+        }
+      }
+      for (const id of Object.keys(state.queue)) if (!seen.has(id)) delete state.queue[id];
+      renderQueue();
     }
+    const busy = ['working', 'assembling', 'downloading'].includes(state.jobState);
+    if (state.panelOpen || busy) pollTimer = setTimeout(pollQueue, 1000);
+  }
+  function kickPoll() {
+    if (!pollTimer) pollTimer = setTimeout(pollQueue, 400);
+  }
+
+  function qualityLabel(f) {
+    if (f.height) return `${f.height}p`;
+    if (f.width) return `${f.width}x${f.height || '?'}`;
+    if (f.kind === 'direct') return 'mp4';
+    return f.kind;
   }
 
   async function startDownload() {
@@ -255,37 +436,81 @@
     state.jobId = jobId;
     state.jobState = 'working';
     state.received = 0; state.total = null; state.progress = null; state.error = null; state.part = null; state.partsTotal = null;
+    // Optimistic queue entry (the SW's queue poll completes it with quality).
+    state.queue[jobId] = { jobId, title: state.info.title || 'Video', quality: qualityLabel(format), state: 'working', received: 0, total: null, progress: null };
+    state.queueOpen = true;
     el.dlBtn.disabled = true;
     renderJob();
-    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-    pollTimer = setTimeout(pollJob, 800);
+    renderQueue();
+    kickPoll();
     try {
       const res = await send({
         type: MSG.DOWNLOAD, jobId, format,
         pageUrl: location.href, host,
         template: state.settings.filenameTemplate,
+        saveAs: state.settings.saveAs !== false,
         title: state.info.title || 'video',
         id: (location.search.match(/viewkey=([\w]+)/) || [])[1] || '',
       });
       if (!res?.ok) {
-        state.jobState = 'error';
+        state.jobState = /cancel/i.test(res?.error || '') ? 'cancelled' : 'error';
         state.error = res?.error || 'Download failed to start';
+        el.dlBtn.disabled = !state.info?.formats?.length;
       }
       // on success: keep 'working' until the first progress event tells us
       // whether we are assembling segments or saving a direct file.
     } catch (e) {
       state.jobState = 'error';
       state.error = e.message;
+      el.dlBtn.disabled = !state.info?.formats?.length;
     }
     renderJob();
   }
 
-  async function cancelJob() {
-    if (!state.jobId) return;
-    try { await send({ type: MSG.CANCEL, jobId: state.jobId }); } catch { /* ignore */ }
-    state.jobState = 'cancelled';
-    state.error = 'Cancelled.';
-    renderJob();
+  async function cancelJobById(jobId) {
+    try { await send({ type: MSG.CANCEL, jobId }); } catch { /* ignore */ }
+    const q = state.queue[jobId];
+    if (q) { q.state = 'cancelled'; q.error = 'Cancelled.'; renderQueue(); }
+    if (jobId === state.jobId) {
+      state.jobState = 'cancelled';
+      state.error = 'Cancelled.';
+      renderJob();
+    }
+  }
+  function cancelJob() {
+    if (state.jobId) cancelJobById(state.jobId);
+  }
+
+  // Queue management (queue rows, any job — including jobs from other tabs).
+
+  async function restartJobById(jobId) {
+    const q = state.queue[jobId];
+    if (q) {
+      q.state = 'working'; q.error = null; q.received = 0; q.progress = null; q.part = null; q.partsTotal = null;
+      renderQueue();
+    }
+    try {
+      const res = await send({ type: MSG.RESTART, jobId });
+      if (!res?.ok && q) { q.state = 'cancelled'; q.error = res?.error || 'Restart failed'; renderQueue(); }
+    } catch (e) {
+      if (q) { q.state = 'cancelled'; q.error = e.message || 'Restart failed'; renderQueue(); }
+    }
+    kickPoll();
+  }
+
+  async function deleteJobById(jobId) {
+    try { await send({ type: MSG.DELETE_JOB, jobId }); } catch { /* ignore */ }
+    delete state.queue[jobId];
+    renderQueue();
+  }
+
+  async function clearFinished() {
+    try { await send({ type: MSG.CLEAR_QUEUE }); } catch { /* ignore */ }
+    for (const id of Object.keys(state.queue)) {
+      if (QUEUE_TERMINAL.has(state.queue[id].state)) delete state.queue[id];
+    }
+    renderQueue();
+    kickPoll();
   }
 
   // ------------------------------------------- media pump (page context)
@@ -302,7 +527,9 @@
   // request after any transient mid-stream failure.
   const PUMP_CHUNK = 1 * 1024 * 1024;
   const PUMP_MAX_ATTEMPTS = 8;
-  let pumpCtrl = null;
+  // One controller per job so parallel pumps in this tab don't clobber each
+  // other (a single shared controller made canceling one job abort the rest).
+  const pumpCtrls = new Map(); // jobId -> AbortController
   const pumpSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   function b64FromU8(u8) {
@@ -314,15 +541,17 @@
     return btoa(bin);
   }
 
-  async function runPump({ jobId, url }) {
+  async function runPump({ jobId, url, offset }) {
     const ctrl = new AbortController();
-    pumpCtrl = ctrl;
+    pumpCtrls.set(jobId, ctrl);
     let lastData = Date.now();
     const watchdog = setInterval(() => {
       if (Date.now() - lastData > 45000) ctrl.abort();
     }, 5000);
     const host = new URL(url).host;
-    let sent = 0;        // total raw bytes delivered to the SW so far
+    // `offset` lets a re-injected pump (after its tab navigated) continue from
+    // the bytes the offscreen accumulator already holds, instead of restarting.
+    let sent = offset || 0; // raw bytes delivered before this pump (resume)
     let totalBytes = 0;  // full file size (progress denominator), once known
     let metaSent = false;
     let lastError = '';
@@ -341,13 +570,29 @@
         if (!res.ok && res.status !== 206) return { ok: false, error: 'HTTP ' + res.status + ' for ' + host };
         const ct = (res.headers.get('content-type') || '').toLowerCase();
         if (ct.startsWith('text/html')) return { ok: false, error: 'Server returned an HTML page, not media [' + host + '] (HTTP ' + res.status + ')' };
+        // Verify a resume actually starts where we expect: if the server
+        // ignored our Range header (plain 200 from byte 0), continuing would
+        // duplicate the bytes already delivered. Reset the accumulator and
+        // start over instead. Checked whenever this pump resumes mid-file
+        // (sent > 0), including its very first attempt.
+        if (sent > 0) {
+          let bodyStart = (res.status === 206) ? sent : 0;
+          const cr0 = res.headers.get('content-range');
+          if (cr0) { const m0 = cr0.match(/^bytes (\d+)-/); if (m0) bodyStart = Number(m0[1]); }
+          if (bodyStart !== sent) {
+            try { chrome.runtime.sendMessage({ type: 'PHD:PAGE_RESET', jobId }); } catch { /* SW gone */ }
+            sent = 0; metaSent = false;
+          }
+        }
         if (!totalBytes) {
           const cr = res.headers.get('content-range'); // "bytes a-b/TOTAL"
           if (cr) { const m = cr.match(/\/(\d+)\s*$/); if (m) totalBytes = Number(m[1]); }
           if (!totalBytes && sent === 0) totalBytes = Number(res.headers.get('content-length')) || 0;
         }
         if (totalBytes && !metaSent) {
-          try { chrome.runtime.sendMessage({ type: 'PHD:PAGE_META', jobId, startOffset: 0, totalBytes }); } catch { /* SW gone */ }
+          // `sent` is the true start of this stream (0 fresh, or the resume
+          // offset; 0 again if a reset above restarted it).
+          try { chrome.runtime.sendMessage({ type: 'PHD:PAGE_META', jobId, startOffset: sent, totalBytes }); } catch { /* SW gone */ }
           metaSent = true;
         }
         const reader = res.body.getReader();
@@ -378,17 +623,14 @@
           chrome.runtime.sendMessage({ type: 'PHD:PAGE_CHUNK', jobId, b64: b64FromU8(tail), n: off });
           sent += off;
         }
-        if (!streamError) {
-          try { chrome.runtime.sendMessage({ type: 'PHD:PAGE_DONE', jobId, size: sent, totalBytes }); } catch { /* SW gone */ }
-          return { ok: true, size: sent, totalBytes };
-        }
+        if (!streamError) return { ok: true, size: sent, totalBytes };
         lastError = streamError;
         await pumpSleep(500 * attempt);
       }
       return { ok: false, error: lastError || 'media fetch failed', size: sent };
     } finally {
       clearInterval(watchdog);
-      if (pumpCtrl === ctrl) pumpCtrl = null;
+      pumpCtrls.delete(jobId);
     }
   }
 
@@ -398,7 +640,14 @@
       return runPump(msg);
     }
     if (msg.type === 'PHD:PAGE_CANCEL') {
-      if (pumpCtrl) pumpCtrl.abort();
+      if (msg.jobId) {
+        // Cancel ONE job's pump; if it has no active pump, nothing to abort
+        // (other jobs' pumps in this tab must keep running).
+        const c2 = pumpCtrls.get(msg.jobId);
+        if (c2) c2.abort();
+      } else {
+        for (const c2 of pumpCtrls.values()) c2.abort();
+      }
       return;
     }
     if (msg.type === 'PHD:PAGE_PROBE') {
@@ -418,22 +667,44 @@
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg || typeof msg !== 'object') return;
-    if (msg.type === MSG.EVENT && msg.jobId === state.jobId) {
-      if (typeof msg.received === 'number') state.received = msg.received;
-      if (msg.total != null) state.total = msg.total;
-      if (msg.progress != null) state.progress = msg.progress;
-      if (msg.error) state.error = msg.error;
-      if (msg.part != null) state.part = msg.part;
-      if (msg.partsTotal != null) state.partsTotal = msg.partsTotal;
-      if (msg.event === 'progress' && (state.jobState === 'idle' || state.jobState === 'working')) {
-        state.jobState = msg.state === 'assembling' ? 'assembling' : 'downloading';
-      } else if (msg.event === 'complete') state.jobState = 'complete';
-      else if (msg.event === 'error') state.jobState = 'error';
-      else if (msg.event === 'cancelled') state.jobState = 'cancelled';
-      if (state.jobState === 'complete' || state.jobState === 'error' || state.jobState === 'cancelled') {
-        el.dlBtn.disabled = !state.info?.formats?.length;
+    if (msg.type === MSG.EVENT && msg.jobId) {
+      // Queue view: broadcasts reach EVERY tab's panel, so each one keeps a
+      // live view of all downloads (cross-tab sync).
+      if (msg.state) {
+        const prev = state.queue[msg.jobId] || {};
+        state.queue[msg.jobId] = {
+          ...prev,
+          jobId: msg.jobId,
+          title: msg.title || prev.title || 'Video',
+          state: msg.state,
+          received: typeof msg.received === 'number' ? msg.received : prev.received,
+          total: msg.total != null ? msg.total : prev.total,
+          progress: msg.progress != null ? msg.progress : prev.progress,
+          error: msg.error || prev.error,
+          part: msg.part != null ? msg.part : prev.part,
+          partsTotal: msg.partsTotal != null ? msg.partsTotal : prev.partsTotal,
+        };
+        renderQueue();
+        kickPoll(); // reconcile full details (quality label) shortly
       }
-      renderJob();
+      if (msg.jobId === state.jobId) {
+        if (typeof msg.received === 'number') state.received = msg.received;
+        if (msg.total != null) state.total = msg.total;
+        if (msg.progress != null) state.progress = msg.progress;
+        if (msg.error) state.error = msg.error;
+        if (msg.part != null) state.part = msg.part;
+        if (msg.partsTotal != null) state.partsTotal = msg.partsTotal;
+        if (msg.event === 'progress' && (state.jobState === 'idle' || state.jobState === 'working')) {
+          state.jobState = msg.state === 'assembling' ? 'assembling' : 'downloading';
+          if (msg.jobId === state.jobId) syncDownloadBtn();
+        } else if (msg.event === 'complete') state.jobState = 'complete';
+        else if (msg.event === 'error') state.jobState = 'error';
+        else if (msg.event === 'cancelled') state.jobState = 'cancelled';
+        if (state.jobState === 'complete' || state.jobState === 'error' || state.jobState === 'cancelled') {
+          el.dlBtn.disabled = !state.info?.formats?.length;
+        }
+        renderJob();
+      }
     } else if (msg.type === 'PHD:TOGGLE_PANEL') {
       setPanelOpen(!state.panelOpen);
     }
@@ -464,6 +735,7 @@
     setPanelOpen(!!state.settings.autoShowPanel);
     try { await send({ type: MSG.SET_HOST, host }); } catch { /* ignore */ }
     refresh();
+    if (state.panelOpen) kickPoll();
   }
 
   if (document.readyState === 'complete' || document.readyState === 'interactive') init();
