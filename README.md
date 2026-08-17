@@ -54,6 +54,16 @@ lib/page-parse.js player page / flashvars parsing
 lib/m3u8.js       HLS parser (master + media playlists)
 lib/mpd.js        DASH MPD parser (best-effort)
 lib/names.js      quality labels + filename building
+test/             unit tests for the lib/ parsers (plain Node, no deps)
+```
+
+## Development
+
+Unit tests for the page / HLS / MPD parsers and filename helpers run on
+plain Node (no dependencies):
+
+```bash
+node --test
 ```
 
 ## Troubleshooting

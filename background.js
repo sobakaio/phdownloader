@@ -69,6 +69,13 @@ async function restoreJobs() {
         const jj = jobs.get(id);
         jj.downloadPoll = setInterval(() => reconcileDownload(jj), 2000);
       }
+      if (j.state === 'working') {
+        // A 'working' job (still pre-pump: token refresh / manifest fetch)
+        // cannot resume on its own after an SW restart — nothing will ever
+        // advance it. Give it a grace window, then fail it cleanly so the
+        // panel offers a retry.
+        chrome.alarms.create('phpd-stuck-' + id, { when: Date.now() + 90000 });
+      }
       n++;
     }
     if (n) {
@@ -128,7 +135,7 @@ async function ensureOffscreen() {
   }
   throw new Error('offscreen media document did not become ready');
 }
-const VERSION = '1.2.2';
+const VERSION = '1.2.3';
 console.log(`phpd: service worker started (v${VERSION})`);
 
 // ---------------------------------------------------------------- utilities
@@ -560,7 +567,7 @@ async function handleDownload(msg, sender) {
       if (!variantUrl && fmt.masterUrl) {
         const masterText = await fetchText(fmt.masterUrl, { timeout: 20000, host });
         const master = parseM3U8(masterText, fmt.masterUrl);
-        const v = pickVariant(master, null);
+        const v = pickVariant(master, fmt);
         if (!v) throw new Error('HLS master has no variants');
         variantUrl = v.url;
       }
@@ -638,7 +645,7 @@ async function handleDownload(msg, sender) {
       }
       if (!refreshed) {
         console.log('phpd: dead link (' + e.message + ') — refreshing page for a new token');
-        job.chunks = []; job.received = 0;
+        job.received = 0;
         if (job.blobUrl) { try { URL.revokeObjectURL(job.blobUrl); } catch {} job.blobUrl = null; }
         format = await refreshFormat(pageUrl, host, format);
         refreshed = true;
@@ -750,9 +757,16 @@ async function releaseJob(job) {
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== 'phpd-keepalive') return;
-  if (![...jobs.values()].some((j) => j.state === 'assembling' || j.state === 'downloading')) {
-    chrome.alarms.clear('phpd-keepalive');
+  if (alarm.name === 'phpd-keepalive') {
+    if (![...jobs.values()].some((j) => j.state === 'assembling' || j.state === 'downloading')) {
+      chrome.alarms.clear('phpd-keepalive');
+    }
+  } else if (alarm.name.startsWith('phpd-stuck-')) {
+    const id = alarm.name.slice('phpd-stuck-'.length);
+    const cur = jobs.get(id);
+    if (cur && cur.state === 'working') {
+      failJob(cur, 'The extension restarted while preparing this download. Press Download again.');
+    }
   }
 });
 
@@ -872,9 +886,6 @@ chrome.downloads.onChanged.addListener((delta) => {
   }
 });
 
-// ------------------------------------------------------------- net logger
-// Logs CDN/site requests (SW fetches AND chrome.downloads) so the download
-// request shape can be compared with the probe when the CDN rejects one but
 // ------------------------------------------------------------- messages
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
