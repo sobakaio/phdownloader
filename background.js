@@ -180,7 +180,7 @@ async function ensureOffscreen() {
   }
   throw new Error('offscreen media document did not become ready');
 }
-const VERSION = '1.4.4';
+const VERSION = '1.4.5';
 console.log(`phpd: service worker started (v${VERSION})`);
 
 // ---------------------------------------------------------------- utilities
