@@ -410,7 +410,7 @@
       el.titleEl.textContent = 'Could not read this video';
       el.meta.textContent = info.error || 'Unknown error';
       el.quality.innerHTML = '';
-      el.dlBtn.disabled = true;
+      syncDownloadBtn();
       return;
     }
     el.titleEl.textContent = info.title || 'Video';
@@ -431,7 +431,7 @@
       else if (f.kind === 'mpd-audio') { bits.push(`audio${f.bandwidth ? ` ${Math.round(f.bandwidth / 1000)}k` : ''}`); }
       else { bits.push('MP4 direct'); if (f.bitrateK) bits.push(`${f.bitrateK} kbps`); }
       const srcTag = f.source && !['get_media', 'mediaDefinitions'].includes(f.source) ? ` (${f.source})` : '';
-      const deadTag = f.kind === 'direct' && f.available === false ? ' · (unavailable)' : '';
+      const deadTag = f.kind === 'direct' && f.available === false ? ' · (probe failed)' : '';
       opt.textContent = bits.filter(Boolean).join(' · ') + srcTag + deadTag + (f.recommended ? '   ★ recommended' : '');
       el.quality.appendChild(opt);
     }
@@ -459,8 +459,8 @@
     else if (preferred) el.quality.value = String(preferred.index);
     else if (rec) el.quality.value = String(rec.index);
     else if (visible.length) el.quality.value = String(visible[0].index);
-    el.dlBtn.disabled = !visible.length;
     updateFilenamePreview();
+    syncDownloadBtn();
   }
 
   // Job progress/status is rendered ONLY in the queue cards below — this
@@ -474,8 +474,42 @@
   // comes back — a long or stuck save must not disable it forever.
   // Double-starts of the same video are rejected by the SW (one active job
   // per videoId), so re-enabling early is safe.
+  function currentVideoId() {
+    return (location.search.match(/viewkey=([\w]+)/) || [])[1] || '';
+  }
+
+  function currentQueueJob() {
+    const id = currentVideoId();
+    if (state.jobId && state.queue[state.jobId]) {
+      const local = state.queue[state.jobId];
+      if (!local.videoId || !id || local.videoId === id) return local;
+    }
+
+    if (!id) return null;
+    return Object.values(state.queue).find((j) => j.videoId === id) || null;
+  }
+
   function syncDownloadBtn() {
-    el.dlBtn.disabled = ['queued', 'working'].includes(state.jobState) || !state.info?.formats?.length;
+    if (!el.dlBtn) return;
+    const q = currentQueueJob();
+    if (q && ['queued', 'working', 'assembling', 'downloading'].includes(q.state)) {
+      el.dlBtn.disabled = true;
+      el.dlBtn.textContent = 'In queue';
+      return;
+    }
+    if (q?.state === 'paused') {
+      el.dlBtn.disabled = !el.quality?.options?.length || !Array.from(el.quality.options).some((o) => !o.disabled);
+      el.dlBtn.textContent = 'Resume';
+      return;
+    }
+    if (q?.state === 'cancelled') {
+      el.dlBtn.disabled = !el.quality?.options?.length || !Array.from(el.quality.options).some((o) => !o.disabled);
+      el.dlBtn.textContent = 'Restart';
+      return;
+    }
+    const hasFormats = !!el.quality?.options?.length && Array.from(el.quality.options).some((o) => !o.disabled);
+    el.dlBtn.disabled = !hasFormats || ['queued', 'working'].includes(state.jobState);
+    el.dlBtn.textContent = 'Download';
   }
 
   // Global queue: every job across all tabs (data synced from the SW via
@@ -670,8 +704,14 @@
           renderJob();
         }
       }
-      for (const id of Object.keys(state.queue)) if (!seen.has(id)) delete state.queue[id];
+      for (const id of Object.keys(state.queue)) {
+        if (!seen.has(id)) {
+          delete state.queue[id];
+          forgetCurrentJob(id);
+        }
+      }
       renderQueue();
+      syncDownloadBtn();
     }
     const busy = QUEUE_RUNNING.has(state.jobState) || state.jobState === 'paused' || state.jobState === 'queued';
     if (state.panelOpen || busy) pollTimer = setTimeout(pollQueue, 1000);
@@ -688,6 +728,30 @@
   }
 
   async function startDownload() {
+    const existing = currentQueueJob();
+    if (existing && ['queued', 'working', 'assembling', 'downloading'].includes(existing.state)) {
+      syncDownloadBtn();
+      return;
+    }
+    if (existing?.state === 'paused') {
+      state.jobId = existing.jobId;
+      existing.state = 'downloading'; existing.paused = false;
+      state.jobState = 'downloading';
+      renderQueue(); renderJob(); syncDownloadBtn();
+      const res = await send({ type: MSG.RESUME, jobId: existing.jobId }).catch((e) => ({ ok: false, error: e.message }));
+      if (!res?.ok) {
+        existing.state = 'paused'; existing.paused = true; state.jobState = 'paused';
+        existing.error = res?.error || 'Could not resume download';
+        renderQueue(); renderJob(); syncDownloadBtn();
+      }
+      kickPoll();
+      return;
+    }
+    if (existing?.state === 'cancelled') {
+      state.jobId = existing.jobId;
+      await restartJobById(existing.jobId);
+      return;
+    }
     if (!state.info?.ok || !el.quality.value) return;
     const format = state.info.formats[Number(el.quality.value)];
     if (!format) return;
@@ -700,9 +764,9 @@
       persistSettings();
     }
     // Optimistic queue entry (the SW's queue poll completes it with quality).
-    state.queue[jobId] = { jobId, title: state.info.title || 'Video', quality: qualityLabel(format), state: 'queued', received: 0, total: null, progress: null };
+    state.queue[jobId] = { jobId, videoId: currentVideoId(), title: state.info.title || 'Video', quality: qualityLabel(format), state: 'queued', received: 0, total: null, progress: null };
     state.queueOpen = true;
-    el.dlBtn.disabled = true;
+    syncDownloadBtn();
     renderJob();
     renderQueue();
     kickPoll();
@@ -714,19 +778,18 @@
         saveAs: state.settings.saveAs !== false,
         notify: state.settings.notifications !== false,
         title: state.info.title || 'video',
-        id: (location.search.match(/viewkey=([\w]+)/) || [])[1] || '',
+        id: currentVideoId(),
       });
       if (!res?.ok) {
         state.jobState = /cancel/i.test(res?.error || '') ? 'cancelled' : 'error';
         state.error = res?.error || 'Download failed to start';
-        el.dlBtn.disabled = !state.info?.formats?.length;
+        syncDownloadBtn();
       }
-      // on success: keep 'working' until the first progress event tells us
-      // whether we are assembling segments or saving a direct file.
+      // on success: keep the queue state until the first progress event.
     } catch (e) {
       state.jobState = 'error';
       state.error = e.message;
-      el.dlBtn.disabled = !state.info?.formats?.length;
+      syncDownloadBtn();
     }
     renderJob();
   }
@@ -762,29 +825,57 @@
     const q = state.queue[jobId];
     if (q) {
       q.state = 'queued'; q.error = null; q.received = 0; q.progress = null; q.part = null; q.partsTotal = null; q.paused = false; q.speed = 0; q.etaSeconds = null;
-      renderQueue();
+      if (q.videoId === currentVideoId() || jobId === state.jobId) {
+        state.jobId = jobId; state.jobState = 'queued';
+      }
+      renderQueue(); renderJob(); syncDownloadBtn();
     }
     try {
       const res = await send({ type: MSG.RESTART, jobId });
-      if (!res?.ok && q) { q.state = 'cancelled'; q.error = res?.error || 'Restart failed'; renderQueue(); }
+      if (!res?.ok && q) {
+        q.state = 'cancelled'; q.error = res?.error || 'Restart failed';
+        if (jobId === state.jobId) state.jobState = 'cancelled';
+        renderQueue(); renderJob(); syncDownloadBtn();
+      }
     } catch (e) {
-      if (q) { q.state = 'cancelled'; q.error = e.message || 'Restart failed'; renderQueue(); }
+      if (q) {
+        q.state = 'cancelled'; q.error = e.message || 'Restart failed';
+        if (jobId === state.jobId) state.jobState = 'cancelled';
+        renderQueue(); renderJob(); syncDownloadBtn();
+      }
     }
     kickPoll();
+  }
+
+  function forgetCurrentJob(jobId) {
+    if (state.jobId !== jobId) return;
+    state.jobId = null;
+    state.jobState = 'idle';
+    state.received = 0; state.total = null; state.progress = null;
+    state.error = null; state.part = null; state.partsTotal = null;
+    renderJob();
+    syncDownloadBtn();
   }
 
   async function deleteJobById(jobId) {
     try { await send({ type: MSG.DELETE_JOB, jobId }); } catch { /* ignore */ }
     delete state.queue[jobId];
+    forgetCurrentJob(jobId);
     renderQueue();
+    syncDownloadBtn();
+    kickPoll();
   }
 
   async function clearFinished() {
     try { await send({ type: MSG.CLEAR_QUEUE }); } catch { /* ignore */ }
     for (const id of Object.keys(state.queue)) {
-      if (QUEUE_TERMINAL.has(state.queue[id].state)) delete state.queue[id];
+      if (QUEUE_TERMINAL.has(state.queue[id].state)) {
+        delete state.queue[id];
+        forgetCurrentJob(id);
+      }
     }
     renderQueue();
+    syncDownloadBtn();
     kickPoll();
   }
 
@@ -928,7 +1019,7 @@
     if (msg.type === 'PHD:PAGE_PROBE') {
       return (async () => {
         try {
-          const r = await fetch(msg.url, { headers: { Range: 'bytes=0-1' } });
+          const r = await fetch(msg.url, { cache: 'no-store', headers: { Range: 'bytes=0-1' } });
           const ct = (r.headers.get('content-type') || '').toLowerCase();
           return { ok: true, status: r.status, ct };
         } catch (e) {
@@ -950,6 +1041,7 @@
         state.queue[msg.jobId] = {
           ...prev,
           jobId: msg.jobId,
+          videoId: msg.videoId != null ? msg.videoId : prev.videoId,
           title: msg.title || prev.title || 'Video',
           state: msg.state,
           received: typeof msg.received === 'number' ? msg.received : prev.received,
@@ -965,6 +1057,7 @@
           fallback: msg.fallback != null ? msg.fallback : prev.fallback,
         };
         renderQueue();
+        syncDownloadBtn();
         kickPoll(); // reconcile full details (quality label) shortly
       }
       if (msg.jobId === state.jobId) {
@@ -980,10 +1073,8 @@
         } else if (msg.event === 'complete') state.jobState = 'complete';
         else if (msg.event === 'error') state.jobState = 'error';
         else if (msg.event === 'cancelled') state.jobState = 'cancelled';
-        if (state.jobState === 'complete' || state.jobState === 'error' || state.jobState === 'cancelled') {
-          el.dlBtn.disabled = !state.info?.formats?.length;
-        }
         renderJob();
+        syncDownloadBtn();
       }
     } else if (msg.type === 'PHD:TOGGLE_PANEL') {
       setPanelOpen(!state.panelOpen);

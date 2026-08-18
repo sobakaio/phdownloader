@@ -238,7 +238,7 @@ async function ensureOffscreen() {
   }
   throw new Error('offscreen media document did not become ready');
 }
-const VERSION = '1.5.0';
+const VERSION = '1.5.1';
 console.log(`phpd: service worker started (v${VERSION})`);
 
 const CONTEXT_MENU_ID = 'phpd-open-panel';
@@ -316,19 +316,26 @@ const fetchText = async (url, opts) => (await fetchWithTimeout(url, opts)).text(
 // Availability probe: the CDN rejects extension-context requests
 // (Sec-Fetch-Site: none), so the HEAD must come from the page context too.
 async function probeDirect(url, host, tabId) {
-  // Probe from the tab that asked for the info (its page context owns the
-  // correct Origin). Falling back to lastTabId here is racy: another tab's
-  // message can flip it mid-refresh, or the panel's own tab can be
-  // mid-navigation — both make healthy formats look '(unavailable)'.
+  // Probe from the requesting tab's page context. A page/CORS/network failure
+  // is inconclusive: Chrome's own download service may still fetch the URL.
   const tid = tabId != null ? tabId : lastTabId;
-  if (tid == null) return false;
+  if (tid == null) return null;
   const tabId2 = tid;
-  try {
-    const r = await chrome.tabs.sendMessage(tabId2, { type: 'PHD:PAGE_PROBE', url });
-    return !!(r && r.ok && (r.status === 200 || r.status === 206) && !(r.ct || '').startsWith('text/html'));
-  } catch {
-    return false;
+  let explicitFailure = 0;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await chrome.tabs.sendMessage(tabId2, { type: 'PHD:PAGE_PROBE', url });
+      if (r?.ok && (r.status === 200 || r.status === 206) && !(r.ct || '').startsWith('text/html')) return true;
+      const hard4xx = r?.ok && r.status >= 400 && r.status < 500 && r.status !== 416;
+      const htmlError = r?.ok && (r.ct || '').startsWith('text/html') && r.status < 500;
+      if (hard4xx || htmlError) explicitFailure++;
+    } catch {
+      // Unknown: the page may be navigating or the CDN may reject CORS.
+    }
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
   }
+  // Only call it unavailable after repeated explicit HTTP/HTML failures.
+  return explicitFailure === 3 ? false : null;
 }
 
 function dedupeAndRank(formats) {
@@ -458,15 +465,16 @@ async function expandCandidates(page, host = activeHost, tabId = null) {
   await Promise.allSettled(deduped.filter((f) => f.kind === 'direct').map(async (f) => {
     f.available = await probeDirect(f.url, host, tabId);
   }));
-  // Unavailable direct links sink below HLS; recommend the best that is alive.
+  // Confirmed-dead direct links sink below HLS; unknown probes stay selectable.
   const rank2 = (f) => {
-    const prio = f.kind === 'direct' ? (f.available ? 0 : 4)
-      : ({ hls: 1, mpd: 2, 'mpd-audio': 3 })[f.kind] ?? 9;
+    const prio = f.kind === 'direct' ? (f.available === true ? 0 : f.available === false ? 4 : 0.5)
+      : ({ hls: 1, mpd: 2, 'mpd-audio': 3 }[f.kind] ?? 9);
     return prio * 1e12 - ((f.height || f.bandwidth || 0));
   };
   deduped.sort((a, b) => rank2(a) - rank2(b));
   for (const f of deduped) f.recommended = false;
-  const best = deduped.find((f) => f.kind === 'direct' && f.available)
+  const best = deduped.find((f) => f.kind === 'direct' && f.available === true)
+    || deduped.find((f) => f.kind === 'direct' && f.available == null)
     || deduped.find((f) => f.kind !== 'direct')
     || deduped[0];
   if (best) best.recommended = true;
@@ -559,6 +567,7 @@ async function refreshFormat(pageUrl, host, wanted, tabId = null) {
 function failJob(job, message) {
   if (TERMINAL_STATES.has(job.state)) return;
   console.error('phpd: job ' + job.jobId + ' FAILED: ' + message);
+  clearDownloadMetrics(job);
   job.state = 'error';
   job.error = message;
   broadcastEvent(job, 'error');
@@ -569,6 +578,11 @@ function failJob(job, message) {
 // The CDN can also kill the link mid-download (chrome.downloads gets
 // interrupted with FILE_NOT_AVAILABLE / an HTTP error). In that case
 // re-fetch the page once and re-issue the download with a fresh URL.
+const USER_CANCEL_ERRORS = new Set(['CANCELED', 'CANCELLED', 'USER_CANCELED', 'USER_CANCELLED', 'USER_CANCELED_BY_USER']);
+function isUserCancelError(error) {
+  return USER_CANCEL_ERRORS.has(String(error || '').toUpperCase());
+}
+
 const RETRYABLE_DL_ERRORS = new Set([
   'FILE_NOT_AVAILABLE', 'SERVER_HTTP_ERROR', 'SERVER_BUSY', 'NETWORK_CHANGED', 'NETWORK_TIMEOUT',
   'NETWORK_FAILED', 'NETWORK_DISCONNECTED', 'SERVER_FAILED', 'SERVER_NO_RANGE', 'NETWORK_INVALID_REQUEST',
@@ -963,6 +977,7 @@ async function handleDownload(msg, sender) {
       broadcastEvent(job, 'cancelled');
       return { ok: false, error: 'cancelled' };
     }
+    clearDownloadMetrics(job);
     job.state = 'error';
     job.error = e.message || String(e);
     broadcastEvent(job, 'error');
@@ -1013,6 +1028,13 @@ async function saveBlobForJob(job, size) {
   return issueSave(job, size);
 }
 
+function clearDownloadMetrics(job) {
+  job.speed = 0;
+  job.etaSeconds = null;
+  job.metricReceived = job.received || 0;
+  job.metricAt = 0;
+}
+
 function updateDownloadMetrics(job, received) {
   const now = Date.now();
   if (!Number.isFinite(received) || received < 0) return;
@@ -1050,6 +1072,7 @@ function broadcastEvent(job, event) {
     downloadId: job.downloadId,
     error: job.error,
     title: job.title,
+    videoId: job.videoId || null,
     part: job.part || null,
     partsTotal: job.partsTotal || null,
     mode: job.mode || null,
@@ -1129,6 +1152,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 function handleDownloadTerminal(job, st, error, fileSize) {
   if (TERMINAL_STATES.has(job.state)) return;
   if (job.downloadPoll) { clearInterval(job.downloadPoll); job.downloadPoll = null; }
+  if (st === 'complete' || st === 'interrupted') clearDownloadMetrics(job);
   if (st === 'complete') {
     const size = fileSize != null ? fileSize : (job.total || job.received || null);
     if (size != null && size < 1024 * 1024) {
@@ -1155,12 +1179,12 @@ function handleDownloadTerminal(job, st, error, fileSize) {
     job.error = 'Cancelled by user.';
     broadcastEvent(job, 'cancelled');
     scheduleRelease(job);
-  } else if (error === 'canceled') {
-    // The user pressed Cancel in the Save As dialog: treat it as a user
-    // cancel (restartable via ↻), not as an error.
+  } else if (isUserCancelError(error)) {
+    // Chrome uses USER_CANCELED/CANCELED (and varies spelling by build) for
+    // both the native Save As dialog and cancellation from its Downloads UI.
     job.cancelled = true;
     job.state = 'cancelled';
-    job.error = 'Cancelled in the Save As dialog.';
+    job.error = 'Cancelled by the user in Chrome.';
     broadcastEvent(job, 'cancelled');
     scheduleRelease(job);
   } else { // interrupted
@@ -1286,6 +1310,7 @@ chrome.downloads.onChanged.addListener((delta) => {
 function queueSnapshot() {
   return [...jobs.values()].map((j) => ({
     jobId: j.jobId,
+    videoId: j.videoId || null,
     title: j.title,
     quality: qualityToken(j.format),
     ext: j.ext,
@@ -1383,9 +1408,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // Re-resolve the format from fresh page data: CDN availability
           // flaps, and the stored format may point at a dead URL now.
           // (If the refresh fails, keep the original — it may still work.)
+          const restartTabId = sender?.tab?.id != null ? sender.tab.id : job.tabId;
           let fmt = job.format;
           if (job.pageUrl) {
-            try { fmt = await refreshFormat(job.pageUrl, job.host, job.format, job.tabId); } catch { /* keep original */ }
+            try { fmt = await refreshFormat(job.pageUrl, job.host, job.format, restartTabId); } catch { /* keep original */ }
           }
           await handleDownload({
             jobId: job.jobId,
@@ -1396,8 +1422,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             title: job.title,
             id: job.videoId,
             saveAs: job.saveAs,
-            tabId: job.tabId,
-          }, null);
+            notify: job.notify,
+            tabId: sender?.tab?.id != null ? sender.tab.id : job.tabId,
+          }, sender || null);
           return { ok: true };
         }
         case MSG.DELETE_JOB: {
@@ -1447,12 +1474,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               try { chrome.tabs.sendMessage(job.tabId, { type: 'PHD:PAGE_CANCEL', jobId: job.jobId }).catch(() => {}); } catch { /* tab gone */ }
             }
             if (job.state === 'queued' || job.state === 'assembling' || job.state === 'working') {
+              clearDownloadMetrics(job);
               job.state = 'cancelled';
               job.error = 'Cancelled by user.';
               broadcastEvent(job, 'cancelled');
               scheduleRelease(job);
             } else if (job.downloadId != null) {
               try { await chrome.downloads.cancel(job.downloadId); } catch { /* gone */ }
+              clearDownloadMetrics(job);
               job.state = 'cancelled';
               job.error = 'Cancelled by user.';
               broadcastEvent(job, 'cancelled');
