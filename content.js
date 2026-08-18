@@ -11,7 +11,7 @@
   const isVideoPage = /view_video\.php|video\/show|\/embed\//.test(location.pathname + location.search);
 
   const state = {
-    settings: { filenameTemplate: '{title} - {quality}', autoShowPanel: true, saveAs: true },
+    settings: { filenameTemplate: '{title} - {quality}', autoShowPanel: true, saveAs: true, hideHls: false },
     info: null,          // {ok,title,duration,formats,notes,error}
     jobId: null,         // the job THIS tab started (drives the main status area)
     jobState: 'idle',    // idle|working|assembling|downloading|complete|error|cancelled
@@ -70,6 +70,7 @@
     .qcancel:hover { color:#ff7675; }
     .qbarwrap { height:5px; background:#0f0f13; border-radius:4px; overflow:hidden; }
     .qbar { height:100%; width:0%; background:linear-gradient(90deg,#6c5ce7,#a29bfe); transition:width .25s; }
+    .qbar.done { background:#00b894; }
     .qstat { color:#8a8a96; font-size:11px; display:flex; justify-content:space-between; gap:8px; }
     .qstat .err { color:#ff7675; }
     .qstat .ok { color:#55efc4; }
@@ -153,7 +154,13 @@
     sAs.append(el.saveAsChk, document.createTextNode('Ask where to save (Save As dialog)'));
     sAs.title = 'OFF: save without a dialog to Chrome\u2019s default downloads folder (Chrome\u2019s global \u201cAsk where to save each file\u201d setting must be off for this mode)';
 
-    el.settingsBlock.append(tLabel, aShow, sAs);
+    const hlsLabel = document.createElement('label'); hlsLabel.className = 'chk';
+    el.hideHlsChk = document.createElement('input'); el.hideHlsChk.type = 'checkbox';
+    el.hideHlsChk.checked = !!state.settings.hideHls;
+    hlsLabel.append(el.hideHlsChk, document.createTextNode('Hide HLS streams'));
+    hlsLabel.title = 'Hide HLS fallback streams from the quality list; direct MP4 downloads are unaffected.';
+
+    el.settingsBlock.append(tLabel, aShow, sAs, hlsLabel);
 
     // --- Queue (collapsible): all downloads across tabs ---
     el.queueHead = document.createElement('div'); el.queueHead.className = 'sect';
@@ -201,6 +208,11 @@
       state.settings.saveAs = el.saveAsChk.checked;
       persistSettings();
     });
+    el.hideHlsChk.addEventListener('change', () => {
+      state.settings.hideHls = el.hideHlsChk.checked;
+      persistSettings();
+      renderInfo();
+    });
     document.documentElement.appendChild(hostEl);
   }
 
@@ -210,6 +222,7 @@
         filenameTemplate: state.settings.filenameTemplate,
         autoShowPanel: !!state.settings.autoShowPanel,
         saveAs: state.settings.saveAs !== false,
+        hideHls: !!state.settings.hideHls,
       });
     } catch { /* storage unavailable */ }
   }
@@ -245,12 +258,16 @@
       return;
     }
     el.titleEl.textContent = info.title || 'Video';
-    el.meta.textContent = [info.duration ? fmtDur(info.duration) : null, `${info.formats.length} formats`,
+    const visible = info.formats.map((f, index) => ({ f, index }))
+      .filter(({ f }) => !state.settings.hideHls || f.kind !== 'hls');
+    const hiddenHls = info.formats.length - visible.length;
+    el.meta.textContent = [info.duration ? fmtDur(info.duration) : null,
+      `${visible.length} formats${hiddenHls ? ` · ${hiddenHls} HLS hidden` : ''}`,
       ...(info.notes || [])].filter(Boolean).join(' · ');
     el.quality.innerHTML = '';
-    for (const f of info.formats) {
+    for (const { f, index } of visible) {
       const opt = document.createElement('option');
-      opt.value = String(info.formats.indexOf(f));
+      opt.value = String(index);
       const bits = [];
       if (f.height) bits.push(`${f.height}p`); else if (f.width) bits.push(`${f.width}x${f.height || '?'}`);
       if (f.kind === 'hls') { bits.push(f.bandwidth ? `${Math.round(f.bandwidth / 1000)} kbps` : ''); bits.push('HLS'); }
@@ -262,10 +279,18 @@
       opt.textContent = bits.filter(Boolean).join(' · ') + srcTag + deadTag + (f.recommended ? '   ★ recommended' : '');
       el.quality.appendChild(opt);
     }
-    // default selection: recommended, else first
-    const recIdx = info.formats.findIndex((f) => f.recommended);
-    if (recIdx >= 0) el.quality.value = String(recIdx);
-    el.dlBtn.disabled = !info.formats.length;
+    if (!visible.length && info.formats.length) {
+      const opt = document.createElement('option');
+      opt.textContent = 'No visible formats — enable HLS in Settings';
+      opt.disabled = true;
+      opt.selected = true;
+      el.quality.appendChild(opt);
+    }
+    // Default selection: recommended visible format, otherwise the first one.
+    const rec = visible.find(({ f }) => f.recommended);
+    if (rec) el.quality.value = String(rec.index);
+    else if (visible.length) el.quality.value = String(visible[0].index);
+    el.dlBtn.disabled = !visible.length;
   }
 
   // Job progress/status is rendered ONLY in the queue cards below — this
@@ -334,7 +359,7 @@
       row.appendChild(top);
 
       const bw = document.createElement('div'); bw.className = 'qbarwrap';
-      const bar = document.createElement('div'); bar.className = 'qbar';
+      const bar = document.createElement('div'); bar.className = 'qbar' + (j.state === 'complete' ? ' done' : '');
       let pct = j.progress != null ? Math.round(j.progress * 100) : 0;
       // Blob -> disk copies report no progress (the browser doesn't track
       // blob saves), so they show full-width; direct CDN downloads stream
@@ -387,6 +412,7 @@
   // jobs the SW has released). One small message per second while the panel
   // is open — cheap.
   let pollTimer = null;
+  let queueInitialized = false;
   async function pollQueue() {
     pollTimer = null;
     let jobs = null;
@@ -395,6 +421,12 @@
       if (r && r.ok) jobs = r.jobs || [];
     } catch { /* SW busy — retry next tick */ }
     if (jobs) {
+      // On first queue sync, show existing entries immediately. Later polls
+      // must not reopen a section the user deliberately collapsed.
+      if (!queueInitialized) {
+        queueInitialized = true;
+        state.queueOpen = jobs.length > 0;
+      }
       const seen = new Set();
       for (const j of jobs) {
         seen.add(j.jobId);

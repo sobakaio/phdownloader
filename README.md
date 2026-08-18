@@ -54,6 +54,9 @@ Status: `Assembling… X / ~Y (N%)` → `Saving file… writing to disk (size)` 
   downloads hang after writing all bytes. (Known bad combo: on at least one
   machine — Chrome 151 + macOS 27 beta — *all* dialog-less saves hang, even
   plain page downloads; there, keep the dialog on.)
+- *Hide HLS streams* — unchecked (default): show HLS fallback qualities in the
+  picker. Check it to hide them; direct MP4 and DASH entries remain visible.
+  Automatic HLS fallback is still available if a direct link fails.
 
 ## Files and formats
 
