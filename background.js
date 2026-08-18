@@ -12,7 +12,6 @@ import { parseM3U8, pickVariant } from './lib/m3u8.js';
 import { parseMPD } from './lib/mpd.js';
 import { buildFilename, qualityToken } from './lib/names.js';
 
-const CDNS = ['phncdn.com', 'phprcdn.com', 'pornhost.com'];
 const MSG = {
   GET_INFO: 'PHD:GET_INFO',
   DOWNLOAD: 'PHD:DOWNLOAD',
@@ -33,12 +32,14 @@ const jobs = new Map(); // jobId -> job (active + terminal queue entries)
 const downloadJobs = new Map(); // chrome.downloads item id -> job
 const DEFAULT_MAX_PARALLEL = 3;
 let maxParallel = DEFAULT_MAX_PARALLEL; // 0 = unlimited
+let settingsReady = Promise.resolve();
 function normalizeMaxParallel(value) {
   const n = Number(value);
   return Number.isInteger(n) && n >= 0 && n <= 4 ? n : DEFAULT_MAX_PARALLEL;
 }
 function slotState(state) {
-  return state === 'working' || state === 'assembling' || state === 'downloading' || state === 'paused';
+  // Paused Chrome downloads do not consume an assembly/concurrency slot.
+  return state === 'working' || state === 'assembling' || state === 'downloading';
 }
 function activeSlotCount() {
   let n = 0;
@@ -77,6 +78,7 @@ const MAX_TERMINAL_QUEUED = 30;           // cap on persisted terminal entries
 // document keep living, and the panel (which polls the SW) keeps working.
 const JOBS_KEY = 'phpdActiveJobs';
 let persistTimer = null;
+let persistChain = Promise.resolve();
 function schedulePersist() {
   if (persistTimer) return;
   persistTimer = setTimeout(() => { persistTimer = null; persistJobs(); }, 1500);
@@ -87,7 +89,8 @@ function jobToRecord(j) {
     title: j.title, ext: j.ext, format: j.format, pageUrl: j.pageUrl, host: j.host,
     template: j.template, videoId: j.videoId,
     saveAs: j.saveAs != null ? j.saveAs : null, createdAt: j.createdAt || null,
-    retryDone: !!j.retryDone, downloadId: j.downloadId != null ? j.downloadId : null,
+    terminalAt: j.terminalAt || null,
+    retryDone: !!j.retryDone, blobRetryDone: !!j.blobRetryDone, downloadId: j.downloadId != null ? j.downloadId : null,
     blobUrl: j.blobUrl || null, blobSize: j.blobSize || null, tabId: j.tabId != null ? j.tabId : null,
     saveName: j.saveName || null, error: j.error || null,
     part: j.part || null, partsTotal: j.partsTotal || null, mode: j.mode || null,
@@ -108,17 +111,31 @@ async function persistJobs() {
   // Cap the retained terminal entries (the newest survive).
   const drop = term.length > MAX_TERMINAL_QUEUED ? term.length - MAX_TERMINAL_QUEUED : 0;
   for (let i = drop; i < term.length; i++) data[term[i][0]] = jobToRecord(term[i][1]);
-  try { await chrome.storage.session.set({ [JOBS_KEY]: data }); } catch { /* SW going down */ }
+  const write = async () => {
+    try { await chrome.storage.session.set({ [JOBS_KEY]: data }); } catch { /* SW going down */ }
+  };
+  persistChain = persistChain.then(write, write);
+  return persistChain;
 }
+function stuckAlarmName(job) {
+  return `phpd-stuck-${job.jobId}-${job.createdAt || 0}`;
+}
+function armStuckAlarm(job, delayMs) {
+  chrome.alarms.create(stuckAlarmName(job), { when: Date.now() + delayMs });
+}
+function blobReleaseAlarmName(job) {
+  return `phpd-release-${job.jobId}-${job.createdAt || 0}`;
+}
+
 // Remove a terminal queue entry after it has aged out (only if the job is
 // still in that same terminal state — a restarted job must not be purged).
 function scheduleTerminalPurge(job) {
   if (!TERMINAL_STATES.has(job.state)) return;
-  const age = Date.now() - (job.createdAt || Date.now());
+  const age = Date.now() - (job.terminalAt || job.createdAt || Date.now());
   const ms = Math.max(1000, TERMINAL_TTL - age);
   setTimeout(() => {
     const cur = jobs.get(job.jobId);
-    if (cur && cur.state === job.state && TERMINAL_STATES.has(cur.state)) {
+    if (cur === job && cur.state === job.state && TERMINAL_STATES.has(cur.state)) {
       jobs.delete(job.jobId);
       schedulePersist();
     }
@@ -133,8 +150,13 @@ async function resumeRestoredQueuedJob(job) {
       template: job.template, title: job.title, id: job.videoId, saveAs: job.saveAs,
       notify: job.notify, tabId: job.tabId,
     }, null);
-    if (!res?.ok) throw new Error(res?.error || 'Queued download could not be resumed');
+    if (!res?.ok && !jobs.has(job.jobId)) {
+      throw new Error(res?.error || 'Queued download could not be resumed');
+    }
+    // handleDownload owns the replacement job object and its terminal state.
   } catch (e) {
+    if (jobs.has(job.jobId)) return;
+    clearDownloadMetrics(job);
     job.state = 'error'; job.error = e.message || String(e); jobs.set(job.jobId, job);
     broadcastEvent(job, 'error'); notifyJob(job, 'error'); scheduleRelease(job);
   }
@@ -149,9 +171,11 @@ async function restoreJobs() {
       if (TERMINAL_STATES.has(j.state)) {
         // Terminal queue entries: restore the recent ones (restart/delete
         // targets) and let the rest age out.
-        if (Date.now() - (j.createdAt || 0) > TERMINAL_TTL) continue;
-        jobs.set(id, { ...j, cancelled: j.state === 'cancelled' });
-        scheduleTerminalPurge(jobs.get(id));
+        if (Date.now() - (j.terminalAt || j.createdAt || 0) > TERMINAL_TTL) continue;
+        const restoredTerminal = { ...j, cancelled: j.state === 'cancelled' };
+        jobs.set(id, restoredTerminal);
+        scheduleTerminalPurge(restoredTerminal);
+        if (restoredTerminal.blobUrl) chrome.alarms.create(blobReleaseAlarmName(restoredTerminal), { when: Date.now() + 60000 });
         n++;
         continue;
       }
@@ -159,6 +183,12 @@ async function restoreJobs() {
         const restored = { ...j, cancelled: false };
         jobs.set(id, restored); n++;
         setTimeout(() => resumeRestoredQueuedJob(restored), 0);
+        continue;
+      }
+      if ((j.state === 'downloading' || j.state === 'paused') && j.downloadId == null) {
+        const restored = { ...j, cancelled: false, state: 'error', error: 'The extension restarted before Chrome created the download. Press Download to retry.' };
+        clearDownloadMetrics(restored);
+        jobs.set(id, restored); scheduleTerminalPurge(restored); n++;
         continue;
       }
       jobs.set(id, { ...j, cancelled: false });
@@ -172,12 +202,11 @@ async function restoreJobs() {
       // dialog (Save As) that was open at the moment of the restart is gone —
       // the item is interrupted and the user can ↻ Restart the job.
 
-      if (j.state === 'working') {
-        // A 'working' job (still pre-pump: token refresh / manifest fetch)
-        // cannot resume on its own after an SW restart — nothing will ever
-        // advance it. Give it a grace window, then fail it cleanly so the
-        // panel offers a retry.
-        chrome.alarms.create('phpd-stuck-' + id, { when: Date.now() + 90000 });
+      if (j.state === 'working' || j.state === 'assembling') {
+        // Token/manifest work and offscreen assembly cannot be reconstructed
+        // from storage alone. Give the live path time to report progress, then
+        // fail a truly orphaned generation with a retryable queue row.
+        armStuckAlarm(jobs.get(id), j.state === 'assembling' ? 300000 : 90000);
       }
       n++;
     }
@@ -211,7 +240,13 @@ function mediaHeadersForUrl(url, host) {
 // renderer process) and returned as a blob URL for chrome.downloads.
 let offscreenReady = false;
 const offMsg = (m) => {
-  try { chrome.runtime.sendMessage(m).catch(() => {}); } catch { /* offscreen gone */ }
+  try {
+    return chrome.runtime.sendMessage(m).catch((e) => {
+      throw new Error('OFFSCREEN_LOST: ' + ((e && e.message) || String(e)));
+    });
+  } catch (e) {
+    return Promise.reject(new Error('OFFSCREEN_LOST: ' + ((e && e.message) || String(e))));
+  }
 };
 async function ensureOffscreen() {
   if (offscreenReady) return;
@@ -238,7 +273,7 @@ async function ensureOffscreen() {
   }
   throw new Error('offscreen media document did not become ready');
 }
-const VERSION = '1.5.4';
+const VERSION = '1.5.5';
 console.log(`phpd: service worker started (v${VERSION})`);
 
 const CONTEXT_MENU_ID = 'phpd-open-panel';
@@ -343,7 +378,7 @@ function dedupeAndRank(formats) {
   const seenDirect = new Set(); // (kind,height) for direct mp4s
   const out = [];
   for (const f of formats) {
-    const key = `${f.kind}|${f.url}|${f.trackId || ''}`;
+    const key = `${f.kind}|${f.url}|${f.variantUrl || ''}|${f.trackId || ''}|${f.height || ''}|${f.bandwidth || ''}`;
     if (seen.has(key)) continue;
     if (f.kind === 'direct') {
       const dk = `direct|${f.height ?? 'n'}`;
@@ -556,6 +591,7 @@ async function refreshFormat(pageUrl, host, wanted, tabId = null) {
 
 function failJob(job, message) {
   if (TERMINAL_STATES.has(job.state)) return;
+  chrome.alarms.clear(stuckAlarmName(job));
   console.error('phpd: job ' + job.jobId + ' FAILED: ' + message);
   clearDownloadMetrics(job);
   job.state = 'error';
@@ -572,6 +608,15 @@ const USER_CANCEL_ERRORS = new Set(['CANCELED', 'CANCELLED', 'USER_CANCELED', 'U
 function isUserCancelError(error) {
   return USER_CANCEL_ERRORS.has(String(error || '').toUpperCase());
 }
+function cancelJobTerminal(job, message = 'Cancelled by user.') {
+  if (TERMINAL_STATES.has(job.state)) return;
+  job.cancelled = true;
+  clearDownloadMetrics(job);
+  job.state = 'cancelled';
+  job.error = message;
+  broadcastEvent(job, 'cancelled');
+  scheduleRelease(job);
+}
 
 const RETRYABLE_DL_ERRORS = new Set([
   'FILE_NOT_AVAILABLE', 'SERVER_HTTP_ERROR', 'SERVER_BUSY', 'NETWORK_CHANGED', 'NETWORK_TIMEOUT',
@@ -581,19 +626,43 @@ const RETRYABLE_DL_ERRORS = new Set([
 async function retryDirectAfterInterrupt(job, reason) {
   // If the media was already fully fetched into the offscreen blob, re-issue
   // the LOCAL disk copy only — do NOT re-download gigabytes from the CDN.
+  if (job.cancelled) throw new Error('Cancelled by user');
   if (job.blobUrl && job.blobSize) {
     console.log('phpd: interrupted (' + reason + ') but the blob is ready — re-issuing the local save');
     // issueSave re-enters the correct path for the job's saveAs setting
     // (native dialog save, or a fresh page anchor save).
-    await issueSave(job, job.blobSize);
+    try {
+      await issueSave(job, job.blobSize);
+    } catch (e) {
+      if (isUserCancelError(e?.message || e)) { cancelJobTerminal(job, 'Cancelled by the user in Chrome.'); return; }
+      throw e;
+    }
     return;
   }
   console.log('phpd: download interrupted (' + reason + ') — refreshing page for a new token');
-  const fmt = await refreshFormat(job.pageUrl, job.host, job.format);
+  const fmt = await refreshFormat(job.pageUrl, job.host, job.format, job.tabId);
   job.format = fmt;
   try {
-    if (!job.rerun) throw new Error('job has no rerun');
-    await job.rerun(fmt);
+    if (job.rerun) {
+      await job.rerun(fmt);
+    } else {
+      // A service-worker restart cannot persist closures. Recreate the
+      // generation through the normal handleDownload path, which rebuilds
+      // rerun/onFallback and keeps the same queue identity.
+      if (job.cancelled) throw new Error('Cancelled by user');
+      const oldJobId = job.jobId;
+      if (jobs.get(oldJobId) === job) jobs.delete(oldJobId);
+      for (const [id, mapped] of downloadJobs) if (mapped === job) downloadJobs.delete(id);
+      const result = await handleDownload({
+        jobId: oldJobId, format: fmt, pageUrl: job.pageUrl, host: job.host,
+        template: job.template, title: job.title, id: job.videoId,
+        saveAs: job.saveAs, notify: job.notify, tabId: job.tabId,
+      }, null);
+      if (!result?.ok) {
+        console.error('phpd: restored retry failed: ' + (result?.error || 'download retry failed'));
+        return;
+      }
+    }
   } catch (e) {
     // Even the fresh token was rejected — try HLS of the same quality.
     if (job.onFallback) {
@@ -647,13 +716,6 @@ async function handleDownload(msg, sender) {
 
   const makeSave = (ext) => buildFilename(template, { title, quality: qualityToken(format), id }, ext);
 
-  // Save a blob (created in the offscreen media document) to disk.
-  const saveBlob = async (blobUrl, ext, size) => {
-    job.ext = ext;
-    job.blobUrl = blobUrl;
-    return saveBlobForJob(job, size);
-  };
-
   // Stream the media bytes in the offscreen document (explicit Origin/Referer
   // — the CDN rejects requests without them) and save the resulting blob.
   // The content script fetches the media in the PAGE context (correct
@@ -688,11 +750,11 @@ async function handleDownload(msg, sender) {
     sendProgress(job);
     ensureKeepAlive();
     await ensureOffscreen();
-    offMsg({ type: 'PHD:OFF_INIT', jobId: job.jobId, fresh: true });
+    await offMsg({ type: 'PHD:OFF_INIT', jobId: job.jobId, fresh: true });
     const res = await pumpViaPage(url);
-    if (job.cancelled) { offMsg({ type: 'PHD:OFF_RELEASE', jobId: job.jobId }); return { ok: false, error: 'Cancelled by user' }; }
+    if (job.cancelled) { await offMsg({ type: 'PHD:OFF_RELEASE', jobId: job.jobId }); return { ok: false, error: 'Cancelled by user' }; }
     if (!res || !res.ok) throw new Error((res && res.error) || 'media fetch failed in page');
-    offMsg({ type: 'PHD:OFF_FINISH', jobId: job.jobId, mime });
+    await offMsg({ type: 'PHD:OFF_FINISH', jobId: job.jobId, mime });
     return { ok: true }; // the save itself is driven by PHD:OFF_DONE
   };
 
@@ -707,12 +769,12 @@ async function handleDownload(msg, sender) {
     sendProgress(job);
     ensureKeepAlive();
     await ensureOffscreen();
-    offMsg({ type: 'PHD:OFF_INIT', jobId: job.jobId, fresh: true });
+    await offMsg({ type: 'PHD:OFF_INIT', jobId: job.jobId, fresh: true });
     for (let i = 0; i < urls.length; i++) {
       if (job.cancelled) throw new Error('Cancelled by user');
       job.part = i + 1;
       sendProgress(job);
-      offMsg({ type: 'PHD:OFF_MARK', jobId: job.jobId });
+      await offMsg({ type: 'PHD:OFF_MARK', jobId: job.jobId });
       let lastErr = null;
       for (let t = 0; t < 3; t++) {
         try {
@@ -726,11 +788,11 @@ async function handleDownload(msg, sender) {
         }
       }
       if (lastErr) {
-        offMsg({ type: 'PHD:OFF_REVERT', jobId: job.jobId });
+        await offMsg({ type: 'PHD:OFF_REVERT', jobId: job.jobId });
         throw lastErr;
       }
     }
-    offMsg({ type: 'PHD:OFF_FINISH', jobId: job.jobId, mime });
+    await offMsg({ type: 'PHD:OFF_FINISH', jobId: job.jobId, mime });
     return { ok: true };
   };
 
@@ -749,7 +811,7 @@ async function handleDownload(msg, sender) {
     const res = await pumpViaPage(fmt.url, job.received);
     if (job.cancelled) return { ok: false, error: 'cancelled' };
     if (!res || !res.ok) throw new Error((res && res.error) || 'resume fetch failed in page');
-    offMsg({ type: 'PHD:OFF_FINISH', jobId: job.jobId, mime });
+    await offMsg({ type: 'PHD:OFF_FINISH', jobId: job.jobId, mime });
     return { ok: true }; // save is driven by PHD:OFF_DONE
   };
 
@@ -757,18 +819,17 @@ async function handleDownload(msg, sender) {
   // re-download from byte 0: either resume in the same tab (still a PH page,
   // direct single-URL job) or stop with an actionable message.
   const handleReceiverLost = async () => {
+    if (job.cancelled) return { ok: false, error: 'cancelled' };
     (job.receiverRetries = (job.receiverRetries || 0) + 1);
     if (job.receiverRetries > 3) {
-      job.state = 'error';
-      job.error = 'Download stopped: the video page kept changing. Press Download (or ↻ Restart) to continue.';
-      broadcastEvent(job, 'error');
-      scheduleRelease(job);
-      return { ok: false, error: job.error };
+      const message = 'Download stopped: the video page kept changing. Press Download (or ↻ Restart) to continue.';
+      failJob(job, message);
+      return { ok: false, error: message };
     }
     // Pump delivered everything before dying — just build the blob.
     if (job.total && job.received >= job.total) {
       console.log('phpd: pump died after full delivery — finishing the blob');
-      offMsg({ type: 'PHD:OFF_FINISH', jobId: job.jobId, mime: job.mime });
+      await offMsg({ type: 'PHD:OFF_FINISH', jobId: job.jobId, mime: job.mime });
       return { ok: true };
     }
     let tab = null;
@@ -776,15 +837,13 @@ async function handleDownload(msg, sender) {
     let isPH = false;
     try { isPH = /(^|\.)(pornhubpremium|pornhub)\.com$/.test(new URL(tab.url).hostname); } catch { isPH = false; }
     if (!tab || !isPH || format0.kind !== 'direct') {
-      job.state = 'error';
-      job.error = 'Download stopped: the video page was closed or navigated away. Press Download (or ↻ Restart) to continue from the beginning.';
-      broadcastEvent(job, 'error');
-      scheduleRelease(job);
-      return { ok: false, error: job.error };
+      const message = 'Download stopped: the video page was closed or navigated away. Press Download (or ↻ Restart) to continue from the beginning.';
+      failJob(job, message);
+      return { ok: false, error: message };
     }
     console.log('phpd: tab navigated mid-download — resuming from ' + job.received + ' bytes in the same tab');
     try {
-      job.format = await refreshFormat(pageUrl, host, job.format);
+      job.format = await refreshFormat(pageUrl, host, job.format, job.tabId);
     } catch (e2) {
       console.log('phpd: token refresh failed, resuming with current URL: ' + ((e2 && e2.message) || e2));
     }
@@ -793,11 +852,9 @@ async function handleDownload(msg, sender) {
       return await resumeDirect(job.format);
     } catch (e3) {
       if (job.cancelled) return { ok: false, error: 'cancelled' };
-      job.state = 'error';
-      job.error = 'Could not resume the download: ' + ((e3 && e3.message) || e3);
-      broadcastEvent(job, 'error');
-      scheduleRelease(job);
-      return { ok: false, error: job.error };
+      const message = 'Could not resume the download: ' + ((e3 && e3.message) || e3);
+      failJob(job, message);
+      return { ok: false, error: message };
     }
   };
 
@@ -826,9 +883,22 @@ async function handleDownload(msg, sender) {
       job.speed = 0; job.etaSeconds = null; job.metricReceived = 0; job.metricAt = 0;
       ensureKeepAlive();
       console.log('phpd: direct CDN download as', name, '(saveAs=' + job.saveAs + ')');
-      job.downloadId = await chrome.downloads.download({
-        url: fmt.url, filename: name, saveAs: job.saveAs, conflictAction: 'uniquify',
-      }).catch((e) => { throw new Error('could not start the download: ' + ((e && e.message) || e)); });
+      job.downloadStarting = true;
+      let downloadId;
+      try {
+        downloadId = await chrome.downloads.download({
+          url: fmt.url, filename: name, saveAs: job.saveAs, conflictAction: 'uniquify',
+        });
+      } catch (e) {
+        throw new Error('could not start the download: ' + ((e && e.message) || e));
+      } finally {
+        job.downloadStarting = false;
+      }
+      if (job.cancelled || TERMINAL_STATES.has(job.state) || job.state !== 'downloading') {
+        try { await chrome.downloads.cancel(downloadId); } catch { /* already gone */ }
+        return { ok: false, error: job.cancelled ? 'cancelled' : 'download superseded' };
+      }
+      job.downloadId = downloadId;
       downloadJobs.set(job.downloadId, job);
       job.downloadPoll = setInterval(() => reconcileDownload(job), 2000);
       sendProgress(job);
@@ -886,18 +956,22 @@ async function handleDownload(msg, sender) {
   // token), assemble the same quality via HLS instead — SW fetch + local
   // blob, so the download stack never touches the CDN.
   job.onFallback = async (reason) => {
-    const { formats } = await refreshAll(pageUrl, host);
+    const { formats } = await refreshAll(pageUrl, host, job.tabId);
     const hls = formats.find((f) => f.kind === 'hls'
       && (f.height === format0.height || f.quality === format0.height || f.quality === format0.quality));
     if (!hls) throw new Error(`CDN rejected the direct link (${reason}) and no HLS variant of ${format0.height || format0.quality}p is available`);
     console.log('phpd: direct link rejected by CDN — falling back to HLS ' + (hls.height || hls.quality));
     job.fallback = 'Direct MP4 failed → HLS fallback';
     job.format = hls;
+    // A failed direct attempt uses .mp4; HLS TS fallback must not inherit
+    // that name, or a transport stream would be mislabeled as MP4.
+    job.saveName = null;
     job.mode = 'assemble';
     job.received = 0;
     job.total = null;
     job.speed = 0; job.etaSeconds = null; job.metricReceived = 0; job.metricAt = 0;
     job.blobUrl = null; // previous offscreen blob (if any) is released via PHD:OFF_RELEASE
+    job.blobRetryDone = false;
     broadcastEvent(job, 'progress');
     return run(hls);
   };
@@ -906,11 +980,12 @@ async function handleDownload(msg, sender) {
   // status, re-fetch the page once (fresh token) and retry the same format.
   let refreshed = false;
   try {
+    await settingsReady;
     await waitForSlot(job);
     const vt = tokenValidTo(format.url);
     if (pageUrl && vt && Date.now() / 1000 > vt - 120) {
       console.log('phpd: link token expired/expiring — refreshing page for a new token');
-      format = await refreshFormat(pageUrl, host, format);
+      format = await refreshFormat(pageUrl, host, format, job.tabId);
       refreshed = true;
     }
     try {
@@ -937,7 +1012,7 @@ async function handleDownload(msg, sender) {
         console.log('phpd: dead link (' + e.message + ') — refreshing page for a new token');
         job.received = 0;
         if (job.blobUrl) { try { URL.revokeObjectURL(job.blobUrl); } catch {} job.blobUrl = null; }
-        format = await refreshFormat(pageUrl, host, format);
+        format = await refreshFormat(pageUrl, host, format, job.tabId);
         refreshed = true;
         try {
           return await run(format);
@@ -961,10 +1036,15 @@ async function handleDownload(msg, sender) {
       throw e;
     }
   } catch (e) {
-    if (job.cancelled) {
-      job.state = 'cancelled';
-      job.error = 'Cancelled by user.';
-      broadcastEvent(job, 'cancelled');
+    if (job.cancelled || isUserCancelError(e?.message || e)) {
+      job.cancelled = true;
+      if (!TERMINAL_STATES.has(job.state)) {
+        clearDownloadMetrics(job);
+        job.state = 'cancelled';
+        job.error = 'Cancelled by user.';
+        broadcastEvent(job, 'cancelled');
+        scheduleRelease(job);
+      }
       return { ok: false, error: 'cancelled' };
     }
     clearDownloadMetrics(job);
@@ -1002,9 +1082,23 @@ async function issueSave(job, size) {
   job.total = size || job.blobSize || null;
   job.part = null; job.partsTotal = null;
   console.log('phpd: chrome.downloads.download blob as', name, '(saveAs=' + job.saveAs + ')');
-  job.downloadId = await chrome.downloads.download({
-    url: job.blobUrl, filename: name, saveAs: job.saveAs, conflictAction: 'uniquify',
-  }).catch((e) => { console.error('phpd: downloads.download rejected:', (e && e.message) || e); throw e; });
+  job.downloadStarting = true;
+  let downloadId;
+  try {
+    downloadId = await chrome.downloads.download({
+      url: job.blobUrl, filename: name, saveAs: job.saveAs, conflictAction: 'uniquify',
+    });
+  } catch (e) {
+    console.error('phpd: downloads.download rejected:', (e && e.message) || e);
+    throw e;
+  } finally {
+    job.downloadStarting = false;
+  }
+  if (job.cancelled || TERMINAL_STATES.has(job.state) || job.state !== 'downloading') {
+    try { await chrome.downloads.cancel(downloadId); } catch { /* already gone */ }
+    return { filename: name, cancelled: !!job.cancelled };
+  }
+  job.downloadId = downloadId;
   downloadJobs.set(job.downloadId, job);
   job.downloadPoll = setInterval(() => reconcileDownload(job), 2000);
   sendProgress(job);
@@ -1064,6 +1158,7 @@ function broadcastEvent(job, event) {
     title: job.title,
     videoId: job.videoId || null,
     pageUrl: job.pageUrl || null,
+    kind: job.format?.kind || null,
     part: job.part || null,
     partsTotal: job.partsTotal || null,
     mode: job.mode || null,
@@ -1097,24 +1192,26 @@ chrome.notifications?.onClicked?.addListener(async (notificationId) => {
 });
 
 function ensureKeepAlive() {
-  // 24 s period: must stay BELOW the 30 s service-worker idle timeout.
-  chrome.alarms.create('phpd-keepalive', { periodInMinutes: 0.4 });
+  // Chrome clamps alarms to a 30 s minimum on modern builds. This is only a
+  // safety net; download events and offscreen messages remain the real work.
+  chrome.alarms.create('phpd-keepalive', { periodInMinutes: 0.5 });
 }
 
 // A job that reaches a terminal state keeps its QUEUE ENTRY (for restart /
 // delete / clear) until it ages out; the heavy stuff (disk-write polling,
 // offscreen blob memory) is released soon after the terminal state.
 function scheduleRelease(job, holdMs = 15000) {
+  job.terminalAt = job.terminalAt || Date.now();
+  chrome.alarms.clear(stuckAlarmName(job));
   setTimeout(() => { releaseJob(job); }, holdMs);
 }
 
 async function releaseJob(job) {
   if (job.downloadPoll) { clearInterval(job.downloadPoll); job.downloadPoll = null; }
   job.blobUrl = null;
-  // The blob/accumulator live in the offscreen document. Free that memory
-  // shortly after (a blob-to-disk copy may still be reading the URL). Always
-  // sent: a failed or cancelled pump can leave a live accumulator behind.
-  setTimeout(() => offMsg({ type: 'PHD:OFF_RELEASE', jobId: job.jobId }), 60000);
+  // The blob/accumulator live in the offscreen document. Do not let an old
+  // generation's delayed release delete a restarted job using the same ID.
+  chrome.alarms.create(blobReleaseAlarmName(job), { when: Date.now() + 60000 });
   for (const [id, j] of downloadJobs) if (j === job) downloadJobs.delete(id);
   // The job entry itself stays in the queue (the user can restart or remove
   // it); it is purged once it has aged out.
@@ -1125,14 +1222,28 @@ async function releaseJob(job) {
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'phpd-keepalive') {
+  if (alarm.name.startsWith('phpd-release-')) {
+    const body = alarm.name.slice('phpd-release-'.length);
+    const cut = body.lastIndexOf('-');
+    const id = cut > 0 ? body.slice(0, cut) : body;
+    const generation = cut > 0 ? Number(body.slice(cut + 1)) : null;
+    const cur = jobs.get(id);
+    if (!cur || generation == null || cur.createdAt === generation) {
+      offMsg({ type: 'PHD:OFF_RELEASE', jobId: id }).catch(() => {});
+      if (cur && (generation == null || cur.createdAt === generation)) { cur.blobUrl = null; schedulePersist(); }
+    }
+  } else if (alarm.name === 'phpd-keepalive') {
     if (![...jobs.values()].some((j) => slotState(j.state) || j.state === 'queued')) {
       chrome.alarms.clear('phpd-keepalive');
     }
   } else if (alarm.name.startsWith('phpd-stuck-')) {
-    const id = alarm.name.slice('phpd-stuck-'.length);
+    const body = alarm.name.slice('phpd-stuck-'.length);
+    const cut = body.lastIndexOf('-');
+    const id = cut > 0 ? body.slice(0, cut) : body;
+    const generation = cut > 0 ? Number(body.slice(cut + 1)) : null;
     const cur = jobs.get(id);
-    if (cur && cur.state === 'working') {
+    if (cur && (generation == null || cur.createdAt === generation)
+        && (cur.state === 'working' || cur.state === 'assembling')) {
       failJob(cur, 'The extension restarted while preparing this download. Press Download again.');
     }
   }
@@ -1143,6 +1254,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 function handleDownloadTerminal(job, st, error, fileSize) {
   if (TERMINAL_STATES.has(job.state)) return;
   if (job.downloadPoll) { clearInterval(job.downloadPoll); job.downloadPoll = null; }
+  if (st === 'interrupted' && job.downloadId != null) {
+    const oldDownloadId = job.downloadId;
+    job.downloadId = null;
+    if (downloadJobs.get(oldDownloadId) === job) downloadJobs.delete(oldDownloadId);
+  }
   if (st === 'complete' || st === 'interrupted') clearDownloadMetrics(job);
   if (st === 'complete') {
     const size = fileSize != null ? fileSize : (job.total || job.received || null);
@@ -1182,13 +1298,18 @@ function handleDownloadTerminal(job, st, error, fileSize) {
     const canRetry = job.pageUrl && job.format?.kind === 'direct'
       && RETRYABLE_DL_ERRORS.has(error);
     const canRetryBlobSave = job.mode === 'blob' && job.blobUrl && job.blobSize && RETRYABLE_DL_ERRORS.has(error);
-    if ((canRetry || canRetryBlobSave) && !job.retryDone) {
-      // First strike: re-issue the direct download with a fresh token.
-      job.retryDone = true;
+    const retryAllowed = (canRetry && !job.retryDone) || (canRetryBlobSave && !job.blobRetryDone);
+    if (retryAllowed) {
+      // First strike: refresh a direct URL, or re-issue a local blob save.
+      if (canRetry) job.retryDone = true;
+      if (canRetryBlobSave) job.blobRetryDone = true;
       job.state = 'working';
       job.error = null;
       broadcastEvent(job, 'progress');
-      retryDirectAfterInterrupt(job, error).catch((e) => failJob(job, e.message || String(e)));
+      retryDirectAfterInterrupt(job, error).catch((e) => {
+        if (isUserCancelError(e?.message || e)) cancelJobTerminal(job, 'Cancelled by the user in Chrome.');
+        else failJob(job, e.message || String(e));
+      });
     } else if (canRetry && job.onFallback) {
       // Second strike: direct rejected even with a fresh token — assemble
       // the same quality via HLS.
@@ -1263,10 +1384,25 @@ async function selfHealScan() {
     } catch { /* tab not injectable */ }
   }
 }
-// Run once now (catches tabs that were open before the SW started) and
-// periodically (catches navigations and SW restarts).
-setInterval(() => { selfHealScan().catch(() => {}); }, 2500);
+// Repair tabs that were already open when the extension started. Normal
+// navigations are handled by the manifest content-script registration.
 selfHealScan().catch(() => {});
+
+// The downloads API emits onCreated before downloads.download() resolves. Keep
+// that ID so Cancel can also stop a native Save As download while its Promise
+// is still awaiting the dialog.
+chrome.downloads.onCreated.addListener((item) => {
+  if (!item || item.id == null) return;
+  const candidates = [...jobs.values()].filter((j) => j.downloadStarting && j.downloadId == null);
+  const match = candidates.find((j) => {
+    const expectedUrl = j.mode === 'direct' ? j.format?.url : j.blobUrl;
+    return expectedUrl && item.url === expectedUrl;
+  }) || (candidates.length === 1 ? candidates[0] : null);
+  if (!match) return;
+  match.downloadId = item.id;
+  downloadJobs.set(item.id, match);
+  if (match.cancelled) chrome.downloads.cancel(item.id).catch(() => {});
+});
 
 chrome.downloads.onChanged.addListener((delta) => {
   const job = jobs.get(delta.id) || downloadJobs.get(delta.id) || null;
@@ -1297,12 +1433,46 @@ chrome.downloads.onChanged.addListener((delta) => {
 
 // ------------------------------------------------------------- messages
 
+function videoIdentity(urlLike) {
+  try {
+    const u = new URL(urlLike);
+    const viewkey = u.searchParams.get('viewkey');
+    if (viewkey) return `video:${viewkey}`;
+    const match = u.pathname.match(/\/(?:embed|video(?:\/show)?)\/([^/?#]+)/i);
+    return match ? `video:${decodeURIComponent(match[1])}` : `page:${u.origin}${u.pathname}`;
+  } catch { return ''; }
+}
+
+function jobMatchesTab(job, tabUrl) {
+  if (!tabUrl) return false;
+  if (job.videoId) {
+    const identity = videoIdentity(tabUrl);
+    if (identity === `video:${job.videoId}`) return true;
+  }
+  return !!(job.pageUrl && videoIdentity(job.pageUrl) === videoIdentity(tabUrl));
+}
+
+async function resolveRestartTab(job, sender) {
+  const candidates = [];
+  if (job.tabId != null) candidates.push(job.tabId);
+  if (sender?.tab?.id != null) candidates.push(sender.tab.id);
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({}); } catch { /* tabs permission unavailable */ }
+  for (const id of [...new Set(candidates)]) {
+    const tab = tabs.find((t) => t.id === id);
+    if (tab && jobMatchesTab(job, tab.url)) return id;
+  }
+  const matching = tabs.find((tab) => jobMatchesTab(job, tab.url));
+  return matching?.id ?? null;
+}
+
 // Snapshot of all jobs (active + recently terminal) for the panel's queue.
 function queueSnapshot() {
   return [...jobs.values()].map((j) => ({
     jobId: j.jobId,
     videoId: j.videoId || null,
     pageUrl: j.pageUrl || null,
+    kind: j.format?.kind || null,
     title: j.title,
     quality: qualityToken(j.format),
     ext: j.ext,
@@ -1366,7 +1536,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // and the job's received counter before the next chunks arrive.
           const job = jobs.get(msg.jobId);
           if (job) {
-            offMsg({ type: 'PHD:OFF_INIT', jobId: msg.jobId, fresh: true });
+            await offMsg({ type: 'PHD:OFF_INIT', jobId: msg.jobId, fresh: true });
             job.received = 0;
           }
           return { ok: true };
@@ -1386,7 +1556,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             // Bytes travel as base64: binary payloads are not transferred by
             // extension messaging (they arrive as empty objects), strings are.
             job.received += msg.n;
-            offMsg({ type: 'PHD:OFF_CHUNK', jobId: msg.jobId, b64: msg.b64, n: msg.n });
+            await offMsg({ type: 'PHD:OFF_CHUNK', jobId: msg.jobId, b64: msg.b64, n: msg.n });
           }
           return { ok: true };
         }
@@ -1397,15 +1567,38 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const job = jobs.get(msg.jobId);
           if (!job) return { ok: false, error: 'unknown job' };
           if (job.state !== 'cancelled') return { ok: false, error: 'only cancelled downloads can be restarted' };
+          // A cancelled row is the restart source; clear its old cancellation
+          // flag, but keep a generation marker so a new Cancel during refresh
+          // can abort this restart before a replacement job is created.
+          const restartGeneration = job.createdAt;
+          job.cancelled = false;
+          job.restartInProgress = true;
           // Re-resolve the format from fresh page data: CDN availability
           // flaps, and the stored format may point at a dead URL now.
           // (If the refresh fails, keep the original — it may still work.)
-          const restartTabId = sender?.tab?.id != null ? sender.tab.id : job.tabId;
+          const restartTabId = await resolveRestartTab(job, sender);
           let fmt = job.format;
           if (job.pageUrl) {
             try { fmt = await refreshFormat(job.pageUrl, job.host, job.format, restartTabId); } catch { /* keep original */ }
           }
-          await handleDownload({
+          if (fmt.kind !== 'direct' && restartTabId == null) {
+            job.restartInProgress = false;
+            return { ok: false, error: 'The source video tab is closed. Open that video page and press Restart again.' };
+          }
+          if (job.cancelled || jobs.get(job.jobId) !== job || job.createdAt !== restartGeneration) {
+            job.restartInProgress = false;
+            return { ok: false, error: 'Restart cancelled' };
+          }
+          // Direct MP4 jobs may never have created an offscreen document.
+          // Do not make Restart depend on sending to a nonexistent receiver.
+          if (job.blobUrl || job.mode === 'blob' || job.mode === 'assemble' || offscreenReady) {
+            try { await offMsg({ type: 'PHD:OFF_RELEASE', jobId: job.jobId }); } catch { offscreenReady = false; }
+          }
+          if (job.cancelled || jobs.get(job.jobId) !== job) {
+            job.restartInProgress = false;
+            return { ok: false, error: 'Restart cancelled' };
+          }
+          const result = await handleDownload({
             jobId: job.jobId,
             format: fmt,
             pageUrl: job.pageUrl,
@@ -1415,9 +1608,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             id: job.videoId,
             saveAs: job.saveAs,
             notify: job.notify,
-            tabId: sender?.tab?.id != null ? sender.tab.id : job.tabId,
+            tabId: restartTabId,
           }, sender || null);
-          return { ok: true };
+          return result?.ok ? { ok: true } : (result || { ok: false, error: 'Restart failed' });
         }
         case MSG.DELETE_JOB: {
           const job = jobs.get(msg.jobId);
@@ -1433,7 +1626,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // active downloads keep running.
           let cleared = 0;
           for (const [id, j] of [...jobs]) {
-            if (TERMINAL_STATES.has(j.state)) { jobs.delete(id); cleared++; }
+            if (TERMINAL_STATES.has(j.state)) {
+              jobs.delete(id);
+              for (const [downloadId, mapped] of downloadJobs) if (mapped === j) downloadJobs.delete(downloadId);
+              cleared++;
+            }
           }
           if (cleared) schedulePersist();
           return { ok: true, cleared };
@@ -1443,7 +1640,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case MSG.PAUSE:
         case MSG.RESUME: {
           const job = jobs.get(msg.jobId);
-          if (!job || job.mode !== 'direct' || job.downloadId == null) {
+          if (!job || job.mode !== 'direct' || job.downloadId == null
+              || !['downloading', 'paused'].includes(job.state)) {
             return { ok: false, error: 'Only active direct MP4 downloads can be paused' };
           }
           const pausing = msg.type === MSG.PAUSE;
@@ -1453,6 +1651,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           } catch (e) {
             return { ok: false, error: (e && e.message) || 'Chrome could not change the download state' };
           }
+          if (jobs.get(msg.jobId) !== job || TERMINAL_STATES.has(job.state)) {
+            return { ok: false, error: 'The download already finished' };
+          }
           job.paused = pausing;
           job.state = pausing ? 'paused' : 'downloading';
           sendProgress(job);
@@ -1461,6 +1662,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case MSG.CANCEL: {
           const job = jobs.get(msg.jobId);
           if (job) {
+            if (TERMINAL_STATES.has(job.state) && !job.restartInProgress) {
+              return { ok: false, error: 'download is already finished' };
+            }
             job.cancelled = true;
             if (job.tabId != null) {
               try { chrome.tabs.sendMessage(job.tabId, { type: 'PHD:PAGE_CANCEL', jobId: job.jobId }).catch(() => {}); } catch { /* tab gone */ }
@@ -1473,6 +1677,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               scheduleRelease(job);
             } else if (job.downloadId != null) {
               try { await chrome.downloads.cancel(job.downloadId); } catch { /* gone */ }
+              clearDownloadMetrics(job);
+              job.state = 'cancelled';
+              job.error = 'Cancelled by user.';
+              broadcastEvent(job, 'cancelled');
+              scheduleRelease(job);
+            } else if (job.state === 'downloading' && job.downloadStarting) {
               clearDownloadMetrics(job);
               job.state = 'cancelled';
               job.error = 'Cancelled by user.';
@@ -1510,6 +1720,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 
-// Re-adopt active jobs after a service-worker restart.
-loadConcurrencySettings();
-restoreJobs();
+// Load synchronized settings before restoring/starting queued jobs so the
+// concurrency limit is honored from the first slot decision.
+settingsReady = loadConcurrencySettings();
+settingsReady.then(() => restoreJobs());

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PHDownloader",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "description": "Download premium PH videos while logged in — quality picker (720p and up, sorted by resolution) and the native Save-as dialog.",
   "minimum_chrome_version": "116",
   "permissions": [
@@ -15,7 +15,11 @@
     "tabs"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "https://*.pornhub.com/*",
+    "https://*.pornhubpremium.com/*",
+    "https://*.phncdn.com/*",
+    "https://*.phprcdn.com/*",
+    "https://*.phcdn.com/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -45,5 +49,6 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "homepage_url": "https://github.com/sobakaio/phdownloader"
 }

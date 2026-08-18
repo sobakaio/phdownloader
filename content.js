@@ -19,7 +19,7 @@
     },
     info: null,          // {ok,title,duration,formats,notes,error}
     jobId: null,         // the job THIS tab started (drives the main status area)
-    jobState: 'idle',    // idle|working|assembling|downloading|complete|error|cancelled
+    jobState: 'idle',    // idle|queued|working|assembling|downloading|paused|complete|error|cancelled
     received: 0, total: null, progress: null, error: null, part: null, partsTotal: null,
     queue: {},           // jobId -> job snapshot (all tabs' jobs, synced from the SW)
     panelOpen: false,
@@ -29,11 +29,22 @@
   };
 
   let root = null;       // shadow root
+  let uiReady = false;
+  let pendingPanelOpen = null;
   const el = {};         // element refs
 
   function send(msg) { return chrome.runtime.sendMessage(msg); }
 
   // ------------------------------------------------------------------ UI
+
+  function makeKeyboardAccessible(node, label) {
+    node.setAttribute('role', 'button');
+    node.setAttribute('tabindex', '0');
+    node.setAttribute('aria-label', label);
+    node.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); node.click(); }
+    });
+  }
 
   const CSS = `
     :host {
@@ -88,7 +99,7 @@
     }
     button:not(:disabled):active { transform:translateY(1px); }
     .dl {
-      background:var(--accent); color:#fff;
+      background:var(--accent); color:#101010;
       box-shadow:0 4px 12px rgba(255,153,0,.22);
     }
     .dl:hover { filter:brightness(1.1); }
@@ -146,6 +157,7 @@
     el.chip.className = 'chip';
     el.chip.textContent = '⬇ Download video';
     el.chip.title = 'PHDownloader';
+    makeKeyboardAccessible(el.chip, 'Open PHDownloader panel');
     root.appendChild(el.chip);
 
     el.panel = document.createElement('div');
@@ -153,7 +165,9 @@
     el.panel.style.display = 'none';
     const head = document.createElement('div');
     head.className = 'head';
-    head.innerHTML = '<b>PHDownloader</b><span class="acts"><span class="x refresh" title="Re-read video data (fresh tokens)">↻</span><span class="x">✕</span></span>';
+    head.innerHTML = '<b>PHDownloader</b><span class="acts"><span class="x refresh" title="Re-read video data (fresh tokens)">↻</span><span class="x close" title="Close panel">✕</span></span>';
+    makeKeyboardAccessible(head.querySelector('.refresh'), 'Refresh video data');
+    makeKeyboardAccessible(head.querySelector('.close'), 'Close panel');
     head.addEventListener('click', (e) => {
       if (e.target.closest('.refresh')) { refresh(); return; }
       setPanelOpen(false);
@@ -252,6 +266,7 @@
     el.clearBtn = document.createElement('span'); el.clearBtn.className = 'qclear';
     el.clearBtn.textContent = 'Clear finished'; el.clearBtn.style.display = 'none';
     el.clearBtn.title = 'Remove all done / failed / cancelled entries (active downloads keep running)';
+    makeKeyboardAccessible(el.clearBtn, 'Clear finished downloads');
     const qChev = document.createElement('span'); qChev.className = 'chev'; qChev.textContent = '▾';
     el.queueChev = qChev;
     const qr = document.createElement('span'); qr.className = 'qacts';
@@ -267,6 +282,8 @@
     el.queueList = document.createElement('div'); el.queueList.className = 'sectblock queueList';
     el.clearBtn.addEventListener('click', (e) => { e.stopPropagation(); clearFinished(); });
 
+    makeKeyboardAccessible(el.settingsHead, 'Toggle settings');
+    makeKeyboardAccessible(el.queueHead, 'Toggle download queue');
     body.append(el.titleEl, el.meta, qLabel, el.btns,
       el.settingsHead, el.settingsBlock, el.queueHead, el.queueTools, el.queueList);
     el.panel.append(head, body);
@@ -277,16 +294,19 @@
       const f = selectedFormat();
       if (f && state.settings.rememberQuality !== false) {
         state.settings.lastQualityKey = qualityKey(f);
-        persistSettings();
+        persistSettings('lastQualityKey');
       }
       updateFilenamePreview();
     });
     el.dlBtn.addEventListener('click', startDownload);
     el.cancelBtn.addEventListener('click', cancelJob);
+    el.settingsHead.setAttribute('aria-expanded', 'false');
+    el.queueHead.setAttribute('aria-expanded', 'false');
     el.settingsHead.addEventListener('click', () => {
       const open = el.settingsBlock.style.display !== 'flex';
       el.settingsBlock.style.display = open ? 'flex' : 'none';
       el.settingsHead.querySelector('.chev').textContent = open ? '▴' : '▾';
+      el.settingsHead.setAttribute('aria-expanded', String(open));
     });
     el.queueHead.addEventListener('click', () => {
       state.queueOpen = !state.queueOpen;
@@ -296,19 +316,19 @@
       const v = el.templateInput.value.trim() || '{title} - {quality}';
       el.templateInput.value = v;
       state.settings.filenameTemplate = v;
-      persistSettings();
+      persistSettings('filenameTemplate');
     });
     el.autoShowChk.addEventListener('change', () => {
       state.settings.autoShowPanel = el.autoShowChk.checked;
-      persistSettings();
+      persistSettings('autoShowPanel');
     });
     el.saveAsChk.addEventListener('change', () => {
       state.settings.saveAs = el.saveAsChk.checked;
-      persistSettings();
+      persistSettings('saveAs');
     });
     el.hideHlsChk.addEventListener('change', () => {
       state.settings.hideHls = el.hideHlsChk.checked;
-      persistSettings();
+      persistSettings('hideHls');
       renderInfo();
     });
     el.templateInput.addEventListener('input', () => {
@@ -317,20 +337,20 @@
     });
     el.rememberQualityChk.addEventListener('change', () => {
       state.settings.rememberQuality = el.rememberQualityChk.checked;
-      persistSettings();
+      persistSettings('rememberQuality');
       renderInfo();
     });
     el.notificationsChk.addEventListener('change', () => {
       state.settings.notifications = el.notificationsChk.checked;
-      persistSettings();
+      persistSettings('notifications');
     });
     el.parallelSelect.addEventListener('change', () => {
       state.settings.maxParallel = Number(el.parallelSelect.value);
-      persistSettings();
+      persistSettings('maxParallel');
     });
     el.profileSelect.addEventListener('change', () => {
       state.settings.qualityProfile = el.profileSelect.value;
-      persistSettings();
+      persistSettings('qualityProfile');
       renderInfo();
     });
     el.queueSearch.addEventListener('input', () => {
@@ -342,11 +362,12 @@
       renderQueue();
     });
     document.documentElement.appendChild(hostEl);
+    uiReady = true;
   }
 
-  function persistSettings() {
+  function persistSettings(key = null) {
     try {
-      chrome.storage.sync.set({
+      const values = {
         filenameTemplate: state.settings.filenameTemplate,
         autoShowPanel: !!state.settings.autoShowPanel,
         saveAs: state.settings.saveAs !== false,
@@ -356,9 +377,31 @@
         qualityProfile: state.settings.qualityProfile || 'remembered',
         notifications: state.settings.notifications !== false,
         maxParallel: Number.isInteger(Number(state.settings.maxParallel)) ? Number(state.settings.maxParallel) : 3,
-      });
+      };
+      chrome.storage.sync.set(key && key in values ? { [key]: values[key] } : values);
     } catch { /* storage unavailable */ }
   }
+
+  chrome.storage?.onChanged?.addListener((changes, area) => {
+    if (area !== 'sync') return;
+    const changed = {};
+    for (const key of Object.keys(state.settings)) {
+      if (changes[key]) changed[key] = changes[key].newValue;
+    }
+    if (!Object.keys(changed).length) return;
+    Object.assign(state.settings, changed);
+    if (!uiReady) return;
+    if (changes.filenameTemplate) el.templateInput.value = state.settings.filenameTemplate || '{title} - {quality}';
+    if (changes.autoShowPanel) el.autoShowChk.checked = !!state.settings.autoShowPanel;
+    if (changes.saveAs) el.saveAsChk.checked = state.settings.saveAs !== false;
+    if (changes.hideHls) el.hideHlsChk.checked = !!state.settings.hideHls;
+    if (changes.rememberQuality) el.rememberQualityChk.checked = state.settings.rememberQuality !== false;
+    if (changes.notifications) el.notificationsChk.checked = state.settings.notifications !== false;
+    if (changes.maxParallel) el.parallelSelect.value = String(state.settings.maxParallel ?? 3);
+    if (changes.qualityProfile) el.profileSelect.value = state.settings.qualityProfile || 'remembered';
+    if (changes.filenameTemplate || changes.hideHls || changes.rememberQuality || changes.lastQualityKey || changes.qualityProfile) renderInfo();
+    else updateFilenamePreview();
+  });
 
   function fmtBytes(n) {
     if (n == null || !Number.isFinite(n)) return '?';
@@ -398,24 +441,36 @@
     return Number.isInteger(index) ? state.info.formats[index] || null : null;
   }
 
+  function buildFilenamePreview(template, ctx, ext) {
+    let name = String(template || '{title} - {quality}')
+      .replace(/\{title\}/gi, ctx.title || 'video')
+      .replace(/\{quality\}/gi, ctx.quality || 'unknown')
+      .replace(/\{id\}/gi, ctx.id || 'id')
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+      .replace(/\s+/g, ' ')
+      .replace(/^[_\s]+|[_\s]+$/g, '')
+      .slice(0, 180);
+    return name ? `${name}.${ext}` : `video.${ext}`;
+  }
+
   function updateFilenamePreview() {
     if (!el.templatePreview) return;
     const f = selectedFormat();
-    const template = el.templateInput?.value.trim() || '{title} - {quality}';
-    const title = state.info?.title || 'Video';
     const quality = f ? qualityLabel(f) : 'quality';
-    const id = (location.search.match(/viewkey=([\w]+)/) || [])[1] || 'video';
     const ext = f?.kind === 'hls' ? (f.container === 'fmp4' ? 'mp4' : 'ts') : f?.kind === 'mpd-audio' ? 'm4a' : 'mp4';
-    const preview = template.replace(/\{title\}/gi, title).replace(/\{quality\}/gi, quality).replace(/\{id\}/gi, id) + '.' + ext;
+    const preview = buildFilenamePreview(el.templateInput?.value.trim(), {
+      title: state.info?.title || 'video', quality, id: currentVideoId() || 'id',
+    }, ext);
     el.templatePreview.textContent = 'Preview: ' + preview;
     el.templatePreview.title = preview;
   }
 
   function setPanelOpen(open) {
-    state.panelOpen = open;
-    el.panel.style.display = open ? '' : 'none';
-    el.chip.textContent = open ? '⬇ Hide panel' : '⬇ Download video';
-    if (open) kickPoll();
+    if (!uiReady) { pendingPanelOpen = !!open; return; }
+    state.panelOpen = !!open;
+    el.panel.style.display = state.panelOpen ? '' : 'none';
+    el.chip.textContent = state.panelOpen ? '⬇ Hide panel' : '⬇ Download video';
+    if (state.panelOpen) kickPoll();
   }
 
   function renderInfo() {
@@ -473,7 +528,8 @@
     // The checkbox gates remembered-quality selection. Explicit profiles always
     // win; with Remember last quality off, the remembered profile falls back to
     // the highest usable direct format (then the first visible format).
-    if (remembered && state.settings.rememberQuality !== false && profile === 'remembered') el.quality.value = String(remembered.index);
+    const rememberedUsable = remembered && (remembered.f.available !== false);
+    if (rememberedUsable && state.settings.rememberQuality !== false && profile === 'remembered') el.quality.value = String(remembered.index);
     else if (preferred) el.quality.value = String(preferred.index);
     updateFilenamePreview();
     syncDownloadBtn();
@@ -485,11 +541,9 @@
     const s = state.jobState;
     el.cancelBtn.style.display = (s === 'queued' || s === 'assembling' || s === 'downloading' || s === 'paused' || s === 'working') ? '' : 'none';
   }
-  // Download is disabled only while the start of THIS tab's job is pending
-  // (state 'working'). Once the job is running (or failed/done) the button
-  // comes back — a long or stuck save must not disable it forever.
-  // Double-starts of the same video are rejected by the SW (one active job
-  // per videoId), so re-enabling early is safe.
+  // The main button follows the queue entry for the current video. Jobs from
+  // other pages remain visible in the shared queue but never change this
+  // page's Download / Resume / Restart action.
   function extractVideoId(urlLike) {
     try {
       const u = new URL(urlLike, location.href);
@@ -535,6 +589,12 @@
     return matches[0] || null;
   }
 
+  function selectedFormatMatchesJob(job) {
+    const f = selectedFormat();
+    if (!f || !job) return true; // preserve restart behavior while info loads
+    return (!job.kind || job.kind === f.kind) && (!job.quality || job.quality === qualityLabel(f));
+  }
+
   function syncDownloadBtn() {
     if (!el.dlBtn) return;
     const q = currentQueueJob();
@@ -548,7 +608,7 @@
       el.dlBtn.textContent = 'Resume';
       return;
     }
-    if (q?.state === 'cancelled') {
+    if (q?.state === 'cancelled' && selectedFormatMatchesJob(q)) {
       el.dlBtn.disabled = !el.quality?.options?.length || !Array.from(el.quality.options).some((o) => !o.disabled);
       el.dlBtn.textContent = 'Restart';
       return;
@@ -569,7 +629,10 @@
       case 'paused': return 'Paused';
       case 'complete': return '✔ Done';
       case 'error': return '✖ ' + (j.error || 'Error');
-      case 'cancelled': return 'Cancelled';
+      case 'cancelled': {
+        const reason = j.error && !/^cancelled(?: by user|\.)?$/i.test(j.error) ? ` — ${j.error}` : '';
+        return 'Cancelled' + reason;
+      }
       default: return j.state;
     }
   }
@@ -599,6 +662,14 @@
     return `${sec}s`;
   }
 
+  function queueAction(className, text, label, handler) {
+    const node = document.createElement('span');
+    node.className = className; node.textContent = text; node.title = label;
+    makeKeyboardAccessible(node, label);
+    node.addEventListener('click', handler);
+    return node;
+  }
+
   function renderQueue() {
     const all = Object.values(state.queue);
     const list = all.filter(queueMatches);
@@ -606,6 +677,7 @@
     el.queueCount.textContent = all.length ? ` (${activeN ? activeN + ' active · ' : ''}${all.length})` : '';
     el.clearBtn.style.display = all.some((j) => QUEUE_TERMINAL.has(j.state)) ? '' : 'none';
     el.queueChev.textContent = state.queueOpen ? '▴' : '▾';
+    el.queueHead.setAttribute('aria-expanded', String(state.queueOpen));
     el.queueTools.style.display = state.queueOpen && all.length ? 'flex' : 'none';
     el.queueList.style.display = state.queueOpen && all.length ? 'flex' : 'none';
     el.queueList.innerHTML = '';
@@ -623,28 +695,21 @@
       t.textContent = j.title || 'Video'; t.title = j.title || '';
       top.appendChild(t);
       if (j.mode === 'direct' && (j.state === 'downloading' || j.state === 'paused')) {
-        const p = document.createElement('span'); p.className = 'qpause'; p.textContent = j.state === 'paused' ? '▶' : 'Ⅱ';
-        p.title = j.state === 'paused' ? 'Resume download' : 'Pause download';
-        p.addEventListener('click', (e) => { e.stopPropagation(); togglePauseJob(j); });
+        const label = j.state === 'paused' ? 'Resume download' : 'Pause download';
+        const p = queueAction('qpause', j.state === 'paused' ? '▶' : 'Ⅱ', label, (e) => { e.stopPropagation(); togglePauseJob(j); });
         top.appendChild(p);
       }
       if (QUEUE_ACTIVE.has(j.state)) {
-        const x = document.createElement('span'); x.className = 'qcancel'; x.textContent = '✕';
-        x.title = 'Cancel this download';
-        x.addEventListener('click', (e) => { e.stopPropagation(); cancelJobById(j.jobId); });
+        const x = queueAction('qcancel', '✕', 'Cancel this download', (e) => { e.stopPropagation(); cancelJobById(j.jobId); });
         top.appendChild(x);
       } else {
         // Terminal entries: cancelled ones can be restarted from scratch,
         // any terminal entry can be removed from the queue.
         if (j.state === 'cancelled') {
-          const r = document.createElement('span'); r.className = 'qcancel'; r.textContent = '↻';
-          r.title = 'Restart this download (from the beginning)';
-          r.addEventListener('click', (e) => { e.stopPropagation(); restartJobById(j.jobId); });
+          const r = queueAction('qcancel', '↻', 'Restart this download (from the beginning)', (e) => { e.stopPropagation(); restartJobById(j.jobId); });
           top.appendChild(r);
         }
-        const d = document.createElement('span'); d.className = 'qcancel'; d.textContent = '✕';
-        d.title = 'Remove from queue';
-        d.addEventListener('click', (e) => { e.stopPropagation(); deleteJobById(j.jobId); });
+        const d = queueAction('qcancel', '✕', 'Remove from queue', (e) => { e.stopPropagation(); deleteJobById(j.jobId); });
         top.appendChild(d);
       }
       row.appendChild(top);
@@ -691,7 +756,9 @@
 
   // ------------------------------------------------------------- actions
 
+  let refreshGeneration = 0;
   async function refresh() {
+    const generation = ++refreshGeneration;
     state.info = null;
     el.titleEl.textContent = 'Reading video data…';
     el.meta.textContent = '';
@@ -699,11 +766,13 @@
     el.dlBtn.disabled = true;
     try {
       const res = await send({ type: MSG.GET_INFO, url: location.href, host, title: document.title });
+      if (generation !== refreshGeneration) return;
       state.info = res && res.ok ? res : (res || { ok: false, error: 'No response from extension background' });
     } catch (e) {
+      if (generation !== refreshGeneration) return;
       state.info = { ok: false, error: e.message };
     }
-    renderInfo();
+    if (generation === refreshGeneration) renderInfo();
   }
 
   // Queue sync: the SW is the single source of truth for ALL jobs (any tab).
@@ -713,8 +782,10 @@
   // is open — cheap.
   let pollTimer = null;
   let queueInitialized = false;
+  let queueEventEpoch = 0;
   async function pollQueue() {
     pollTimer = null;
+    const epochAtStart = queueEventEpoch;
     let jobs = null;
     try {
       const r = await send({ type: MSG.GET_QUEUE });
@@ -752,6 +823,11 @@
       }
       for (const id of Object.keys(state.queue)) {
         if (!seen.has(id)) {
+          const local = state.queue[id];
+          // Do not let a GET_QUEUE response that began before a broadcast
+          // erase a newer event (or a just-created optimistic row).
+          if ((local.lastEventEpoch || 0) > epochAtStart
+              || (local.optimisticAt && Date.now() - local.optimisticAt < 3000)) continue;
           delete state.queue[id];
           forgetCurrentJob(id);
         }
@@ -793,7 +869,7 @@
       kickPoll();
       return;
     }
-    if (existing?.state === 'cancelled') {
+    if (existing?.state === 'cancelled' && selectedFormatMatchesJob(existing)) {
       state.jobId = existing.jobId;
       await restartJobById(existing.jobId);
       return;
@@ -807,10 +883,10 @@
     state.received = 0; state.total = null; state.progress = null; state.error = null; state.part = null; state.partsTotal = null;
     if (state.settings.rememberQuality !== false) {
       state.settings.lastQualityKey = qualityKey(format);
-      persistSettings();
+      persistSettings('lastQualityKey');
     }
     // Optimistic queue entry (the SW's queue poll completes it with quality).
-    state.queue[jobId] = { jobId, videoId: currentVideoId(), pageUrl: location.href, title: state.info.title || 'Video', quality: qualityLabel(format), state: 'queued', received: 0, total: null, progress: null };
+    state.queue[jobId] = { jobId, videoId: currentVideoId(), pageUrl: location.href, kind: format.kind, title: state.info.title || 'Video', quality: qualityLabel(format), state: 'queued', received: 0, total: null, progress: null, optimisticAt: Date.now() };
     state.queueOpen = true;
     syncDownloadBtn();
     renderJob();
@@ -827,15 +903,22 @@
         id: currentVideoId(),
       });
       if (!res?.ok) {
-        state.jobState = /cancel/i.test(res?.error || '') ? 'cancelled' : 'error';
-        state.error = res?.error || 'Download failed to start';
-        syncDownloadBtn();
+        const message = res?.error || 'Download failed to start';
+        const failedState = /cancel/i.test(message) ? 'cancelled' : 'error';
+        const local = state.queue[jobId];
+        if (local) { local.state = failedState; local.error = message; local.optimisticAt = 0; local.speed = 0; local.etaSeconds = null; }
+        state.jobState = failedState;
+        state.error = message;
+        renderQueue(); syncDownloadBtn();
       }
       // on success: keep the queue state until the first progress event.
     } catch (e) {
+      const message = e.message || String(e);
+      const local = state.queue[jobId];
+      if (local) { local.state = 'error'; local.error = message; local.optimisticAt = 0; local.speed = 0; local.etaSeconds = null; }
       state.jobState = 'error';
-      state.error = e.message;
-      syncDownloadBtn();
+      state.error = message;
+      renderQueue(); syncDownloadBtn();
     }
     renderJob();
   }
@@ -849,6 +932,7 @@
       state.error = 'Cancelled.';
       renderJob();
     }
+    syncDownloadBtn();
   }
   function cancelJob() {
     if (state.jobId) cancelJobById(state.jobId);
@@ -944,6 +1028,15 @@
   const pumpCtrls = new Map(); // jobId -> AbortController
   const pumpSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  async function sendPumpMessage(message) {
+    try {
+      const response = await chrome.runtime.sendMessage(message);
+      if (response?.ok === false) throw new Error(response.error || 'background rejected pump message');
+    } catch (e) {
+      throw new Error('PUMP_LOST: ' + ((e && e.message) || String(e)));
+    }
+  }
+
   function b64FromU8(u8) {
     let bin = '';
     const N = 0x8000;
@@ -954,11 +1047,10 @@
   }
 
   async function runPump({ jobId, url, offset }) {
-    const ctrl = new AbortController();
-    pumpCtrls.set(jobId, ctrl);
+    let ctrl = null;
     let lastData = Date.now();
     const watchdog = setInterval(() => {
-      if (Date.now() - lastData > 45000) ctrl.abort();
+      if (ctrl && Date.now() - lastData > 45000) ctrl.abort();
     }, 5000);
     const host = new URL(url).host;
     // `offset` lets a re-injected pump (after its tab navigated) continue from
@@ -969,6 +1061,9 @@
     let lastError = '';
     try {
       for (let attempt = 1; attempt <= PUMP_MAX_ATTEMPTS; attempt++) {
+        ctrl = new AbortController();
+        pumpCtrls.set(jobId, ctrl);
+        lastData = Date.now();
         const headers = {};
         if (sent > 0) headers.Range = 'bytes=' + sent + '-';
         let res;
@@ -992,7 +1087,7 @@
           const cr0 = res.headers.get('content-range');
           if (cr0) { const m0 = cr0.match(/^bytes (\d+)-/); if (m0) bodyStart = Number(m0[1]); }
           if (bodyStart !== sent) {
-            try { chrome.runtime.sendMessage({ type: 'PHD:PAGE_RESET', jobId }); } catch { /* SW gone */ }
+            await sendPumpMessage({ type: 'PHD:PAGE_RESET', jobId });
             sent = 0; metaSent = false;
           }
         }
@@ -1004,7 +1099,7 @@
         if (totalBytes && !metaSent) {
           // `sent` is the true start of this stream (0 fresh, or the resume
           // offset; 0 again if a reset above restarted it).
-          try { chrome.runtime.sendMessage({ type: 'PHD:PAGE_META', jobId, startOffset: sent, totalBytes }); } catch { /* SW gone */ }
+          await sendPumpMessage({ type: 'PHD:PAGE_META', jobId, startOffset: sent, totalBytes });
           metaSent = true;
         }
         const reader = res.body.getReader();
@@ -1024,7 +1119,7 @@
             buf.set(v.subarray(vs, vs + take), off);
             off += take; vs += take;
             if (off === PUMP_CHUNK) {
-              chrome.runtime.sendMessage({ type: 'PHD:PAGE_CHUNK', jobId, b64: b64FromU8(buf), n: PUMP_CHUNK });
+              await sendPumpMessage({ type: 'PHD:PAGE_CHUNK', jobId, b64: b64FromU8(buf), n: PUMP_CHUNK });
               sent += PUMP_CHUNK;
               off = 0;
             }
@@ -1032,7 +1127,7 @@
         }
         if (off > 0) {
           const tail = buf.slice(0, off);
-          chrome.runtime.sendMessage({ type: 'PHD:PAGE_CHUNK', jobId, b64: b64FromU8(tail), n: off });
+          await sendPumpMessage({ type: 'PHD:PAGE_CHUNK', jobId, b64: b64FromU8(tail), n: off });
           sent += off;
         }
         if (!streamError) return { ok: true, size: sent, totalBytes };
@@ -1046,10 +1141,13 @@
     }
   }
 
-  chrome.runtime.onMessage.addListener((msg) => {
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || typeof msg !== 'object') return;
     if (msg.type === 'PHD:PAGE_FETCH') {
-      return runPump(msg);
+      runPump(msg)
+        .then(sendResponse)
+        .catch((e) => sendResponse({ ok: false, error: (e && e.message) || String(e) }));
+      return true;
     }
     if (msg.type === 'PHD:PAGE_CANCEL') {
       if (msg.jobId) {
@@ -1063,15 +1161,21 @@
       return;
     }
     if (msg.type === 'PHD:PAGE_PROBE') {
-      return (async () => {
+      (async () => {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 8000);
         try {
-          const r = await fetch(msg.url, { cache: 'no-store', headers: { Range: 'bytes=0-1' } });
+          const r = await fetch(msg.url, { cache: 'no-store', signal: ctrl.signal, headers: { Range: 'bytes=0-1' } });
           const ct = (r.headers.get('content-type') || '').toLowerCase();
+          try { await r.body?.cancel(); } catch { /* headers are enough */ }
           return { ok: true, status: r.status, ct };
         } catch (e) {
           return { ok: false, error: (e && e.message) || String(e) };
+        } finally {
+          clearTimeout(timer);
         }
-      })();
+      })().then(sendResponse);
+      return true;
     }
   });
 
@@ -1084,11 +1188,14 @@
       // live view of all downloads (cross-tab sync).
       if (msg.state) {
         const prev = state.queue[msg.jobId] || {};
+        const eventEpoch = ++queueEventEpoch;
         state.queue[msg.jobId] = {
           ...prev,
+          lastEventEpoch: eventEpoch,
           jobId: msg.jobId,
           videoId: msg.videoId != null ? msg.videoId : prev.videoId,
           pageUrl: msg.pageUrl != null ? msg.pageUrl : prev.pageUrl,
+          kind: msg.kind != null ? msg.kind : prev.kind,
           title: msg.title || prev.title || 'Video',
           state: msg.state,
           received: typeof msg.received === 'number' ? msg.received : prev.received,
@@ -1124,7 +1231,8 @@
         syncDownloadBtn();
       }
     } else if (msg.type === 'PHD:TOGGLE_PANEL') {
-      setPanelOpen(!state.panelOpen);
+      const current = pendingPanelOpen != null ? pendingPanelOpen : state.panelOpen;
+      setPanelOpen(!current);
     } else if (msg.type === 'PHD:SHOW_PANEL') {
       setPanelOpen(true);
     }
@@ -1133,11 +1241,12 @@
   // popup asks for state — respond synchronously-ish
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type === 'PHD:POPUP_STATE') {
+      const current = currentQueueJob();
       sendResponse({
-        ok: true, isVideoPage, host,
+        ok: true, ready: uiReady, isVideoPage, host,
         title: state.info?.title || null,
-        jobState: state.jobState, progress: state.progress, error: state.error,
-        panelOpen: state.panelOpen, formats: state.info?.formats?.length || 0,
+        jobState: current?.state || state.jobState, progress: current?.progress ?? state.progress, error: current?.error || state.error,
+        panelOpen: state.panelOpen, formats: state.info?.formats?.length || 0, infoReady: !!state.info,
       });
       return true;
     }
@@ -1154,7 +1263,9 @@
       ? Number(state.settings.maxParallel) : 3;
     if (!isVideoPage) return;
     buildUI();
-    setPanelOpen(!!state.settings.autoShowPanel);
+    const requestedPanelOpen = pendingPanelOpen;
+    pendingPanelOpen = null;
+    setPanelOpen(requestedPanelOpen != null ? requestedPanelOpen : !!state.settings.autoShowPanel);
     try { await send({ type: MSG.SET_HOST, host }); } catch { /* ignore */ }
     refresh();
     if (state.panelOpen) kickPoll();

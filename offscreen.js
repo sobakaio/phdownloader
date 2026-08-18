@@ -70,7 +70,7 @@ async function finishAcc(jobId, mime) {
   post({ type: 'PHD:OFF_DONE', jobId, ok: true, blobUrl, size: blob.size });
 }
 
-chrome.runtime.onMessage.addListener((msg) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === 'PHD:OFF_INIT') {
     if (msg.fresh || !accs.has(msg.jobId)) accs.set(msg.jobId, newAcc());
     return;
@@ -112,6 +112,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     return;
   }
   if (msg?.type === 'PHD:OFF_PING') {
-    return Promise.resolve({ ok: true });
+    sendResponse({ ok: true });
+    return true;
   }
 });

@@ -20,6 +20,8 @@ media bytes → a local file.
 3. Click **Load unpacked** and pick this folder.
 4. Log in to the premium site in the same browser profile.
 
+Chrome **116 or newer** is required. Node **18 or newer** is required only to run the test suite.
+
 ## Use
 
 1. Open a premium video page.
@@ -34,7 +36,8 @@ media bytes → a local file.
 Queue management (per row / bulk):
 
 - Direct MP4 rows show live **speed** and **ETA**; the **Ⅱ / ▶** control pauses
-  and resumes them through Chrome's download service.
+  and resumes them through Chrome's download service. Paused direct jobs do not
+  consume a parallel-download slot, so queued work can continue.
 - **✕** on an active row cancels that download.
 - **↻** on a *cancelled* row restarts that download from the beginning.
 - **✕** on a finished / failed / cancelled row removes that row from the queue.
@@ -73,22 +76,37 @@ to open the panel.
 
 ## License and legal notice
 
-The source code is released under the [MIT License](LICENSE). This license
-covers only the PHDownloader source code; it does not grant rights to any
-videos, website content, PH/Pornhub trademarks, accounts, or services. PHDownloader
-is an independent project and is not affiliated with or endorsed by Pornhub.
+The project-owned source code, documentation, and artwork are released under
+the [MIT License](LICENSE). Third-party components and references retain their
+upstream terms. This license does not grant rights to any videos, website
+content, PH/Pornhub trademarks, accounts, or services. PHDownloader is an
+independent project and is not affiliated with or endorsed by Pornhub.
 Use it only with content you are authorized to access and save, and follow the
 applicable website terms and copyright laws.
 
+## Privacy, support, and attribution
+
+There is no telemetry or analytics. Video page data, signed media URLs, and
+queue metadata are processed locally in the extension; queue state uses
+`storage.session`, while preferences use `storage.sync`. The extension does
+not upload downloaded media to a project server.
+
+Project repository and issue tracker: <https://github.com/sobakaio/phdownloader>.
+The page-level parsing approach in `lib/page-parse.js` is adapted from yt-dlp's
+PornHub extractor; see the upstream attribution in that file and `NOTICE.md`.
+
 ## Files and formats
 
-| Source      | Output | Notes                                             |
-|-------------|--------|---------------------------------------------------|
-| Direct MP4  | `.mp4` | Primary path. Seekable, plays anywhere.           |
-| HLS fallback| `.ts`  | Only if the CDN rejects the direct link even with a fresh token. Linear container — some players cannot seek it. Remux when needed: `ffmpeg -i in.ts -c copy in.mp4` (a few seconds, no re-encode). |
+| Source                | Output        | Notes |
+|-----------------------|---------------|-------|
+| Direct MP4            | `.mp4`        | Primary path. Seekable, plays anywhere. |
+| HLS (manual/fallback) | `.ts` / `.mp4` | TS is linear; fMP4 HLS can be saved as MP4. Remux TS when needed: `ffmpeg -i in.ts -c copy in.mp4`. |
+| DASH video            | `.mp4`        | Segment layouts are assembled locally; some tracks may be video-only. |
+| DASH audio            | `.m4a`        | Separate audio representation when exposed by the page. |
 
 The suggested filename follows `{title} - {quality}` (e.g.
-`My Video - 2160p.mp4`); the native dialog lets you change it.
+`My Video - 2160p.mp4`); the native dialog lets you change it. The extension
+matches the actual container, so an MPEG-TS HLS fallback ends in `.ts`.
 
 ## Why the download works the way it does (short version)
 
@@ -107,7 +125,7 @@ assembles the blob the browser saves at the end.
 ## Repository layout
 
 ```
-manifest.json     MV3 manifest (permissions: downloads, storage, alarms, offscreen, scripting, tabs)
+manifest.json     MV3 manifest (scoped PH/CDN host access; downloads, storage, notifications, contextMenus, alarms, offscreen, scripting, tabs)
 background.js     service worker: orchestration, token refresh, save pipeline
 content.js        page panel + media pump (fetches in page context)
 popup.html/js     toolbar popup: status for the active tab
@@ -115,7 +133,7 @@ offscreen.html/js offscreen document: multi-GB blob accumulators (one per job)
 lib/page-parse.js player page / flashvars parsing
 lib/m3u8.js       HLS parser (master + media playlists)
 lib/mpd.js        DASH MPD parser (best-effort)
-lib/names.js      quality labels + filename building
+lib/names.js      filename building + compact quality tokens
 test/             unit tests for the lib/ parsers (plain Node, no deps)
 ```
 
@@ -136,16 +154,18 @@ node --test
   re-fetches the page and retries automatically. If it fails twice, the error
   is shown in the panel. A network-level failure of a direct link (CDN flap)
   falls back to HLS of the same quality on its own.
-- **Download stopped after I navigated the tab** — usually automatic: the
-  extension resumes interrupted page pumps (up to 3 times per job). If the
-  source tab was closed, or the navigation left the premium site, the job
-  stops with an error — restart it from the queue (↻).
+- **Download stopped after I navigated the tab** — this applies to HLS/DASH
+  page-pump jobs: the extension resumes interrupted pumps (up to 3 times per
+  job). Direct MP4 downloads are owned by Chrome and do not need the page to
+  stay open. If an assembly source tab was closed or left the premium site,
+  restart it from the queue (↻).
 - **`.ts` plays jerkily / cannot seek** — that is a container property of
   MPEG-TS, not data corruption. Remux: `ffmpeg -i in.ts -c copy in.mp4`.
-- **Very large files** — 4K files can exceed 1.5 GB; the extension keeps the
-  bytes in one preallocated buffer in a dedicated offscreen process.
-- **Parallel downloads** — each active job keeps its bytes in the offscreen
-  process until the file is on disk (a few most-recent finished blobs are
-  kept briefly). Two or three parallel 4K downloads are the realistic
+- **Very large files** — 4K files can exceed 1.5 GB; HLS/DASH bytes are
+  accumulated as chunks and then materialized as a Blob in a dedicated
+  offscreen process before the browser saves them.
+- **Parallel downloads** — each assembly job keeps its chunks/blob until the
+  local save has had time to finish, then releases it (typically about 75 s
+  after terminal state). Two or three parallel 4K downloads are the realistic
   ceiling on modest RAM; 720p–1080p parallel is comfortable.
 
