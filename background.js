@@ -180,7 +180,7 @@ async function ensureOffscreen() {
   }
   throw new Error('offscreen media document did not become ready');
 }
-const VERSION = '1.4.2';
+const VERSION = '1.4.3';
 console.log(`phpd: service worker started (v${VERSION})`);
 
 // ---------------------------------------------------------------- utilities
@@ -1049,13 +1049,17 @@ async function reconcileDownload(job) {
   if (!items.length) return;
   const item = items[0];
   if (item.state === 'in_progress') {
-    // The browser owns the bytes (direct CDN download, or the blob -> disk
-    // copy): mirror its progress into the queue card.
-    if (item.totalBytes) job.total = item.totalBytes;
-    if (item.fileSize != null && item.fileSize !== job.received) {
-      job.received = item.fileSize;
-      sendProgress(job);
+    // fileSize is the final file size and may equal totalBytes immediately.
+    // bytesReceived is the live counter used by Chrome's Download Manager.
+    const oldReceived = job.received;
+    const oldTotal = job.total;
+    if (item.totalBytes > 0) job.total = item.totalBytes;
+    // Blob saves have no useful streaming progress; direct CDN items do.
+    // Keep the fallback for a restored/legacy job whose mode is absent.
+    if (job.mode !== 'blob' && Number.isFinite(item.bytesReceived) && item.bytesReceived >= 0) {
+      job.received = item.bytesReceived;
     }
+    if (job.received !== oldReceived || job.total !== oldTotal) sendProgress(job);
     return;
   }
   if (item.state === 'complete' || item.state === 'interrupted') {
@@ -1130,6 +1134,7 @@ function queueSnapshot() {
     progress: j.total ? Math.min(1, j.received / j.total) : null,
     part: j.part || null,
     partsTotal: j.partsTotal || null,
+    mode: j.mode || null,
     error: j.error || null,
     tabId: j.tabId != null ? j.tabId : null,
     createdAt: j.createdAt || null,

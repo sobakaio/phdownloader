@@ -338,7 +338,7 @@
       let pct = j.progress != null ? Math.round(j.progress * 100) : 0;
       // Blob -> disk copies report no progress (the browser doesn't track
       // blob saves), so they show full-width; direct CDN downloads stream
-      // real per-second progress (reconcileDownload mirrors fileSize/total).
+      // real per-second progress (reconcileDownload mirrors bytesReceived/total).
       if (j.state === 'complete' || (j.state === 'downloading' && j.mode !== 'direct')) pct = 100;
       if (j.state === 'error' || j.state === 'cancelled') pct = j.progress != null ? Math.round(j.progress * 100) : 0;
       bar.style.width = pct + '%';
