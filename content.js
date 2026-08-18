@@ -31,10 +31,10 @@
   const CSS = `
     :host {
       all: initial;
-      --accent: #ff7a18;
-      --accent-hover: #ff922f;
-      --accent-soft: #ffb36b;
-      --panel: #15161b;
+      --accent: rgb(255, 153, 0);
+      --accent-hover: rgb(255, 153, 0);
+      --accent-soft: rgb(255, 153, 0);
+      --panel: rgb(16, 16, 16);
       --panel-raised: #1b1c22;
       --surface: #101116;
       --line: #30313a;
@@ -71,7 +71,7 @@
       background:var(--surface); color:var(--text); border:1px solid var(--line); border-radius:7px;
       padding:6px 8px; font-size:12px; width:100%; transition:border-color .15s, box-shadow .15s;
     }
-    select:focus, input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 2px rgba(255,122,24,.16); }
+    select:focus, input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 2px rgba(255,153,0,.16); }
     .row { display:flex; gap:7px; align-items:center; }
     .btns { display:flex; gap:7px; }
     button {
@@ -80,8 +80,8 @@
     }
     button:not(:disabled):active { transform:translateY(1px); }
     .dl {
-      background:linear-gradient(135deg, var(--accent), #ff6414); color:#fff;
-      box-shadow:0 4px 12px rgba(255,122,24,.22);
+      background:var(--accent); color:#fff;
+      box-shadow:0 4px 12px rgba(255,153,0,.22);
     }
     .dl:hover { filter:brightness(1.1); }
     .dl:disabled { opacity:.42; cursor:default; box-shadow:none; }
@@ -105,7 +105,7 @@
     .qcancel { cursor:pointer; color:#9697a2; font-size:12px; padding:0 4px; flex:0 0 auto; transition:color .15s; }
     .qcancel:hover { color:#ff7675; }
     .qbarwrap { height:4px; background:#0c0d11; border-radius:4px; overflow:hidden; }
-    .qbar { height:100%; width:0%; background:linear-gradient(90deg,var(--accent),var(--accent-soft)); transition:width .25s; }
+    .qbar { height:100%; width:0%; background:var(--accent); transition:width .25s; }
     .qbar.done { background:#00b894; }
     .qstat { color:var(--muted); font-size:10px; display:flex; justify-content:space-between; gap:7px; }
     .qstat .err { color:#ff7675; }
