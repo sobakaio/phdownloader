@@ -31,7 +31,9 @@ async function main() {
   const bits = [];
   if (st.title) bits.push(`“${st.title.slice(0, 60)}${st.title.length > 60 ? '…' : ''}”`);
   bits.push(`${st.formats || 0} formats found`);
-  if (st.jobState === 'assembling') bits.push('assembling segments…');
+  if (st.jobState === 'queued') bits.push('queued');
+  else if (st.jobState === 'assembling') bits.push('assembling segments…');
+  else if (st.jobState === 'paused') bits.push('paused');
   else if (st.jobState === 'downloading') bits.push(`saving ${Math.round((st.progress || 0) * 100)}%`);
   else if (st.jobState === 'complete') bits.push('last download: done ✔');
   else if (st.jobState === 'error') bits.push(`error: ${st.error}`);

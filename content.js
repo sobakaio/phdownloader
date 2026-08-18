@@ -5,13 +5,18 @@
   if (window.__phpdLoaded) return;
   window.__phpdLoaded = true;
 
-  const MSG = { GET_INFO: 'PHD:GET_INFO', DOWNLOAD: 'PHD:DOWNLOAD', CANCEL: 'PHD:CANCEL', SET_HOST: 'PHD:SET_HOST', EVENT: 'PHD:EVENT', GET_QUEUE: 'PHD:GET_QUEUE', RESTART: 'PHD:RESTART', DELETE_JOB: 'PHD:DELETE_JOB', CLEAR_QUEUE: 'PHD:CLEAR_QUEUE' };
+  const MSG = { GET_INFO: 'PHD:GET_INFO', DOWNLOAD: 'PHD:DOWNLOAD', CANCEL: 'PHD:CANCEL', PAUSE: 'PHD:PAUSE', RESUME: 'PHD:RESUME', SET_HOST: 'PHD:SET_HOST', EVENT: 'PHD:EVENT', GET_QUEUE: 'PHD:GET_QUEUE', RESTART: 'PHD:RESTART', DELETE_JOB: 'PHD:DELETE_JOB', CLEAR_QUEUE: 'PHD:CLEAR_QUEUE' };
   const QUEUE_TERMINAL = new Set(['complete', 'error', 'cancelled']);
+  const QUEUE_ACTIVE = new Set(['queued', 'working', 'assembling', 'downloading', 'paused']);
+  const QUEUE_RUNNING = new Set(['working', 'assembling', 'downloading']);
   const host = location.hostname.endsWith('pornhubpremium.com') ? 'pornhubpremium.com' : 'pornhub.com';
   const isVideoPage = /view_video\.php|video\/show|\/embed\//.test(location.pathname + location.search);
 
   const state = {
-    settings: { filenameTemplate: '{title} - {quality}', autoShowPanel: true, saveAs: true, hideHls: false },
+    settings: {
+      filenameTemplate: '{title} - {quality}', autoShowPanel: true, saveAs: true, hideHls: false,
+      rememberQuality: true, lastQualityKey: null, qualityProfile: 'remembered', notifications: true, maxParallel: 3,
+    },
     info: null,          // {ok,title,duration,formats,notes,error}
     jobId: null,         // the job THIS tab started (drives the main status area)
     jobState: 'idle',    // idle|working|assembling|downloading|complete|error|cancelled
@@ -19,6 +24,8 @@
     queue: {},           // jobId -> job snapshot (all tabs' jobs, synced from the SW)
     panelOpen: false,
     queueOpen: false,
+    queueQuery: '',
+    queueFilter: 'all',
   };
 
   let root = null;       // shadow root
@@ -66,8 +73,9 @@
     .body { padding: 10px; display:flex; flex-direction:column; gap:8px; }
     .title { font-size:13px; font-weight:650; line-height:1.3; max-height:3.9em; overflow:hidden; }
     .meta { color:var(--muted); font-size:11px; line-height:1.3; }
+    .preview { color:#777985; font-size:10px; line-height:1.25; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     label.fld { display:flex; flex-direction:column; gap:4px; color:#c1c2ca; font-size:11px; }
-    select, input[type=text] {
+    select, input[type=text], input[type=search] {
       background:var(--surface); color:var(--text); border:1px solid var(--line); border-radius:7px;
       padding:6px 8px; font-size:12px; width:100%; transition:border-color .15s, box-shadow .15s;
     }
@@ -102,8 +110,9 @@
     .qrow + .qrow { margin-top:5px; }
     .qtop { display:flex; align-items:center; gap:7px; }
     .qtitle { flex:1; font-size:11px; font-weight:650; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .qcancel { cursor:pointer; color:#9697a2; font-size:12px; padding:0 4px; flex:0 0 auto; transition:color .15s; }
-    .qcancel:hover { color:#ff7675; }
+    .qcancel, .qpause { cursor:pointer; color:#9697a2; font-size:12px; padding:2px 4px; min-width:20px; text-align:center; flex:0 0 auto; transition:color .15s, background .15s; border-radius:5px; }
+    .qcancel:hover { color:#ff7675; background:rgba(255,118,117,.1); }
+    .qpause:hover { color:var(--accent); background:rgba(255,153,0,.1); }
     .qbarwrap { height:4px; background:#0c0d11; border-radius:4px; overflow:hidden; }
     .qbar { height:100%; width:0%; background:var(--accent); transition:width .25s; }
     .qbar.done { background:#00b894; }
@@ -114,6 +123,13 @@
     .qclear { cursor:pointer; color:#9697a2; font-size:10px; padding:2px 6px; border:1px solid #393a43; border-radius:5px; transition:color .15s, border-color .15s; }
     .qclear:hover { color:var(--text); border-color:var(--accent); }
     .qstat .l { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .qdetail { color:#777985; font-size:10px; min-height:12px; }
+    .qfallback { color:#fdcb6e; font-size:10px; line-height:1.2; }
+    .qtools { display:none; flex-direction:row; gap:6px; }
+    .qtools input { min-width:0; flex:1; }
+    .qtools select { width:88px; flex:0 0 88px; }
+    .queueList { max-height:calc(100vh - 230px); overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; }
+    .qempty { color:#777985; font-size:11px; padding:8px 2px; text-align:center; }
   `;
 
   function buildUI() {
@@ -174,6 +190,8 @@
     el.templateInput.value = state.settings.filenameTemplate;
     el.templateInput.placeholder = '{title} - {quality}';
     tLabel.appendChild(el.templateInput);
+    el.templatePreview = document.createElement('div'); el.templatePreview.className = 'preview';
+    tLabel.appendChild(el.templatePreview);
 
     const aShow = document.createElement('label'); aShow.className = 'chk';
     el.autoShowChk = document.createElement('input'); el.autoShowChk.type = 'checkbox';
@@ -196,7 +214,35 @@
     hlsLabel.append(el.hideHlsChk, document.createTextNode('Hide HLS streams'));
     hlsLabel.title = 'Hide HLS fallback streams from the quality list; direct MP4 downloads are unaffected.';
 
-    el.settingsBlock.append(tLabel, aShow, sAs, hlsLabel);
+    const rememberLabel = document.createElement('label'); rememberLabel.className = 'chk';
+    el.rememberQualityChk = document.createElement('input'); el.rememberQualityChk.type = 'checkbox';
+    el.rememberQualityChk.checked = state.settings.rememberQuality !== false;
+    rememberLabel.append(el.rememberQualityChk, document.createTextNode('Remember last quality'));
+
+    const notifyLabel = document.createElement('label'); notifyLabel.className = 'chk';
+    el.notificationsChk = document.createElement('input'); el.notificationsChk.type = 'checkbox';
+    el.notificationsChk.checked = state.settings.notifications !== false;
+    notifyLabel.append(el.notificationsChk, document.createTextNode('Desktop notifications'));
+
+    const profileLabel = document.createElement('label'); profileLabel.className = 'fld';
+    profileLabel.append(document.createTextNode('Quality profile'));
+    el.profileSelect = document.createElement('select');
+    for (const [value, label] of [['remembered', 'Remembered quality'], ['highest', 'Highest available'], ['highest-direct', 'Highest direct MP4'], ['highest-hls', 'Highest HLS fallback']]) {
+      const opt = document.createElement('option'); opt.value = value; opt.textContent = label; el.profileSelect.appendChild(opt);
+    }
+    el.profileSelect.value = state.settings.qualityProfile || 'remembered';
+    profileLabel.appendChild(el.profileSelect);
+
+    const parallelLabel = document.createElement('label'); parallelLabel.className = 'fld';
+    parallelLabel.append(document.createTextNode('Maximum parallel downloads'));
+    el.parallelSelect = document.createElement('select');
+    for (const [value, label] of [['1', '1'], ['2', '2'], ['3', '3'], ['4', '4'], ['0', 'Unlimited']]) {
+      const opt = document.createElement('option'); opt.value = value; opt.textContent = label; el.parallelSelect.appendChild(opt);
+    }
+    el.parallelSelect.value = String(state.settings.maxParallel ?? 3);
+    parallelLabel.appendChild(el.parallelSelect);
+
+    el.settingsBlock.append(tLabel, aShow, sAs, hlsLabel, rememberLabel, notifyLabel, profileLabel, parallelLabel);
 
     // --- Queue (collapsible): all downloads across tabs ---
     el.queueHead = document.createElement('div'); el.queueHead.className = 'sect';
@@ -207,18 +253,34 @@
     el.clearBtn.textContent = 'Clear finished'; el.clearBtn.style.display = 'none';
     el.clearBtn.title = 'Remove all done / failed / cancelled entries (active downloads keep running)';
     const qChev = document.createElement('span'); qChev.className = 'chev'; qChev.textContent = '▾';
+    el.queueChev = qChev;
     const qr = document.createElement('span'); qr.className = 'qacts';
     qr.append(el.clearBtn, qChev);
     el.queueHead.append(ql, qr);
-    el.queueList = document.createElement('div'); el.queueList.className = 'sectblock';
+    el.queueTools = document.createElement('div'); el.queueTools.className = 'qtools';
+    el.queueSearch = document.createElement('input'); el.queueSearch.type = 'search'; el.queueSearch.placeholder = 'Search queue…';
+    el.queueFilter = document.createElement('select');
+    for (const [value, label] of [['all', 'All'], ['active', 'Active'], ['done', 'Done'], ['errors', 'Errors']]) {
+      const opt = document.createElement('option'); opt.value = value; opt.textContent = label; el.queueFilter.appendChild(opt);
+    }
+    el.queueTools.append(el.queueSearch, el.queueFilter);
+    el.queueList = document.createElement('div'); el.queueList.className = 'sectblock queueList';
     el.clearBtn.addEventListener('click', (e) => { e.stopPropagation(); clearFinished(); });
 
     body.append(el.titleEl, el.meta, qLabel, el.btns,
-      el.settingsHead, el.settingsBlock, el.queueHead, el.queueList);
+      el.settingsHead, el.settingsBlock, el.queueHead, el.queueTools, el.queueList);
     el.panel.append(head, body);
     root.appendChild(el.panel);
 
     el.chip.addEventListener('click', () => setPanelOpen(!state.panelOpen));
+    el.quality.addEventListener('change', () => {
+      const f = selectedFormat();
+      if (f && state.settings.rememberQuality !== false) {
+        state.settings.lastQualityKey = qualityKey(f);
+        persistSettings();
+      }
+      updateFilenamePreview();
+    });
     el.dlBtn.addEventListener('click', startDownload);
     el.cancelBtn.addEventListener('click', cancelJob);
     el.settingsHead.addEventListener('click', () => {
@@ -249,6 +311,35 @@
       persistSettings();
       renderInfo();
     });
+    el.templateInput.addEventListener('input', () => {
+      state.settings.filenameTemplate = el.templateInput.value.trim() || '{title} - {quality}';
+      updateFilenamePreview();
+    });
+    el.rememberQualityChk.addEventListener('change', () => {
+      state.settings.rememberQuality = el.rememberQualityChk.checked;
+      persistSettings();
+    });
+    el.notificationsChk.addEventListener('change', () => {
+      state.settings.notifications = el.notificationsChk.checked;
+      persistSettings();
+    });
+    el.parallelSelect.addEventListener('change', () => {
+      state.settings.maxParallel = Number(el.parallelSelect.value);
+      persistSettings();
+    });
+    el.profileSelect.addEventListener('change', () => {
+      state.settings.qualityProfile = el.profileSelect.value;
+      persistSettings();
+      renderInfo();
+    });
+    el.queueSearch.addEventListener('input', () => {
+      state.queueQuery = el.queueSearch.value.trim().toLowerCase();
+      renderQueue();
+    });
+    el.queueFilter.addEventListener('change', () => {
+      state.queueFilter = el.queueFilter.value;
+      renderQueue();
+    });
     document.documentElement.appendChild(hostEl);
   }
 
@@ -259,6 +350,11 @@
         autoShowPanel: !!state.settings.autoShowPanel,
         saveAs: state.settings.saveAs !== false,
         hideHls: !!state.settings.hideHls,
+        rememberQuality: state.settings.rememberQuality !== false,
+        lastQualityKey: state.settings.lastQualityKey || null,
+        qualityProfile: state.settings.qualityProfile || 'remembered',
+        notifications: state.settings.notifications !== false,
+        maxParallel: Number.isInteger(Number(state.settings.maxParallel)) ? Number(state.settings.maxParallel) : 3,
       });
     } catch { /* storage unavailable */ }
   }
@@ -274,6 +370,30 @@
     if (!s) return '';
     const m = Math.floor(s / 60), sec = s % 60;
     return `${m}:${String(sec).padStart(2, '0')}`;
+  }
+
+  function qualityKey(f) {
+    if (!f) return '';
+    return [f.kind, f.height ?? '', f.quality ?? '', f.width ?? '', f.bitrateK ?? '', f.trackId ?? '', f.container ?? ''].join('|');
+  }
+
+  function selectedFormat() {
+    if (!state.info?.formats || !el.quality) return null;
+    const index = Number(el.quality.value);
+    return Number.isInteger(index) ? state.info.formats[index] || null : null;
+  }
+
+  function updateFilenamePreview() {
+    if (!el.templatePreview) return;
+    const f = selectedFormat();
+    const template = el.templateInput?.value.trim() || '{title} - {quality}';
+    const title = state.info?.title || 'Video';
+    const quality = f ? qualityLabel(f) : 'quality';
+    const id = (location.search.match(/viewkey=([\w]+)/) || [])[1] || 'video';
+    const ext = f?.kind === 'hls' ? (f.container === 'fmp4' ? 'mp4' : 'ts') : f?.kind === 'mpd-audio' ? 'm4a' : 'mp4';
+    const preview = template.replace(/\{title\}/gi, title).replace(/\{quality\}/gi, quality).replace(/\{id\}/gi, id) + '.' + ext;
+    el.templatePreview.textContent = 'Preview: ' + preview;
+    el.templatePreview.title = preview;
   }
 
   function setPanelOpen(open) {
@@ -322,18 +442,32 @@
       opt.selected = true;
       el.quality.appendChild(opt);
     }
-    // Default selection: recommended visible format, otherwise the first one.
+    // Choose the remembered quality or the selected quality profile.
+    const remembered = state.settings.rememberQuality !== false
+      ? visible.find(({ f }) => qualityKey(f) === state.settings.lastQualityKey) : null;
+    const rank = ({ f }) => Number(f.height || f.width || f.bandwidth || f.bitrateK || 0);
+    const direct = visible.filter(({ f }) => f.kind === 'direct' && f.available !== false).sort((a, b) => rank(b) - rank(a));
+    const hls = visible.filter(({ f }) => f.kind === 'hls').sort((a, b) => rank(b) - rank(a));
+    const highest = visible.slice().sort((a, b) => rank(b) - rank(a));
     const rec = visible.find(({ f }) => f.recommended);
-    if (rec) el.quality.value = String(rec.index);
+    const profile = state.settings.qualityProfile || 'remembered';
+    const preferred = profile === 'highest-direct' ? direct[0]
+      : profile === 'highest-hls' ? hls[0]
+      : profile === 'highest' ? highest[0]
+      : null;
+    if (remembered && profile === 'remembered') el.quality.value = String(remembered.index);
+    else if (preferred) el.quality.value = String(preferred.index);
+    else if (rec) el.quality.value = String(rec.index);
     else if (visible.length) el.quality.value = String(visible[0].index);
     el.dlBtn.disabled = !visible.length;
+    updateFilenamePreview();
   }
 
   // Job progress/status is rendered ONLY in the queue cards below — this
   // function just toggles the Cancel button for the local job.
   function renderJob() {
     const s = state.jobState;
-    el.cancelBtn.style.display = (s === 'assembling' || s === 'downloading' || s === 'working') ? '' : 'none';
+    el.cancelBtn.style.display = (s === 'queued' || s === 'assembling' || s === 'downloading' || s === 'paused' || s === 'working') ? '' : 'none';
   }
   // Download is disabled only while the start of THIS tab's job is pending
   // (state 'working'). Once the job is running (or failed/done) the button
@@ -341,30 +475,65 @@
   // Double-starts of the same video are rejected by the SW (one active job
   // per videoId), so re-enabling early is safe.
   function syncDownloadBtn() {
-    el.dlBtn.disabled = state.jobState === 'working' || !state.info?.formats?.length;
+    el.dlBtn.disabled = ['queued', 'working'].includes(state.jobState) || !state.info?.formats?.length;
   }
 
   // Global queue: every job across all tabs (data synced from the SW via
   // PHD:EVENT broadcasts + PHD:GET_QUEUE polls). Rendered in start order.
-  const QUEUE_ACTIVE = new Set(['working', 'assembling', 'downloading']);
   function queueStateText(j) {
     switch (j.state) {
+      case 'queued': return 'Queued';
       case 'working': return 'Starting…';
       case 'assembling': return j.partsTotal ? `Assembling ${j.part || 0}/${j.partsTotal}` : 'Assembling…';
       case 'downloading': return j.mode === 'direct' ? 'Downloading…' : 'Saving file…';
+      case 'paused': return 'Paused';
       case 'complete': return '✔ Done';
       case 'error': return '✖ ' + (j.error || 'Error');
       case 'cancelled': return 'Cancelled';
       default: return j.state;
     }
   }
+
+  function queueMatches(j) {
+    const query = state.queueQuery;
+    const haystack = [j.title, j.quality, j.state, j.fallback, j.error].filter(Boolean).join(' ').toLowerCase();
+    if (query && !haystack.includes(query)) return false;
+    if (state.queueFilter === 'active') return QUEUE_ACTIVE.has(j.state);
+    if (state.queueFilter === 'done') return j.state === 'complete';
+    if (state.queueFilter === 'errors') return j.state === 'error' || j.state === 'cancelled';
+    return true;
+  }
+
+  function fmtRate(n) {
+    if (!Number.isFinite(n) || n <= 0) return '';
+    return fmtBytes(n) + '/s';
+  }
+
+  function fmtEta(s) {
+    if (!Number.isFinite(s) || s < 0) return '';
+    s = Math.round(s);
+    const h = Math.floor(s / 3600); s %= 3600;
+    const m = Math.floor(s / 60); const sec = s % 60;
+    if (h) return `${h}h ${String(m).padStart(2, '0')}m`;
+    if (m) return `${m}m ${String(sec).padStart(2, '0')}s`;
+    return `${sec}s`;
+  }
+
   function renderQueue() {
-    const list = Object.values(state.queue);
-    const activeN = list.filter((j) => QUEUE_ACTIVE.has(j.state)).length;
-    el.queueCount.textContent = list.length ? ` (${activeN ? activeN + ' active · ' : ''}${list.length})` : '';
-    el.clearBtn.style.display = list.some((j) => QUEUE_TERMINAL.has(j.state)) ? '' : 'none';
-    el.queueList.style.display = state.queueOpen && list.length ? 'flex' : 'none';
+    const all = Object.values(state.queue);
+    const list = all.filter(queueMatches);
+    const activeN = all.filter((j) => QUEUE_ACTIVE.has(j.state)).length;
+    el.queueCount.textContent = all.length ? ` (${activeN ? activeN + ' active · ' : ''}${all.length})` : '';
+    el.clearBtn.style.display = all.some((j) => QUEUE_TERMINAL.has(j.state)) ? '' : 'none';
+    el.queueChev.textContent = state.queueOpen ? '▴' : '▾';
+    el.queueTools.style.display = state.queueOpen && all.length ? 'flex' : 'none';
+    el.queueList.style.display = state.queueOpen && all.length ? 'flex' : 'none';
     el.queueList.innerHTML = '';
+    if (state.queueOpen && all.length && !list.length) {
+      const empty = document.createElement('div'); empty.className = 'qempty'; empty.textContent = 'No matching downloads';
+      el.queueList.appendChild(empty);
+      return;
+    }
     for (const j of list) {
       const row = document.createElement('div'); row.className = 'qrow';
       row.dataset.jobId = j.jobId;
@@ -373,6 +542,12 @@
       const t = document.createElement('div'); t.className = 'qtitle';
       t.textContent = j.title || 'Video'; t.title = j.title || '';
       top.appendChild(t);
+      if (j.mode === 'direct' && (j.state === 'downloading' || j.state === 'paused')) {
+        const p = document.createElement('span'); p.className = 'qpause'; p.textContent = j.state === 'paused' ? '▶' : 'Ⅱ';
+        p.title = j.state === 'paused' ? 'Resume download' : 'Pause download';
+        p.addEventListener('click', (e) => { e.stopPropagation(); togglePauseJob(j); });
+        top.appendChild(p);
+      }
       if (QUEUE_ACTIVE.has(j.state)) {
         const x = document.createElement('span'); x.className = 'qcancel'; x.textContent = '✕';
         x.title = 'Cancel this download';
@@ -397,9 +572,7 @@
       const bw = document.createElement('div'); bw.className = 'qbarwrap';
       const bar = document.createElement('div'); bar.className = 'qbar' + (j.state === 'complete' ? ' done' : '');
       let pct = j.progress != null ? Math.round(j.progress * 100) : 0;
-      // Blob -> disk copies report no progress (the browser doesn't track
-      // blob saves), so they show full-width; direct CDN downloads stream
-      // real per-second progress (reconcileDownload mirrors bytesReceived/total).
+      // Blob -> disk copies report no progress; direct downloads report live bytes.
       if (j.state === 'complete' || (j.state === 'downloading' && j.mode !== 'direct')) pct = 100;
       if (j.state === 'error' || j.state === 'cancelled') pct = j.progress != null ? Math.round(j.progress * 100) : 0;
       bar.style.width = pct + '%';
@@ -412,14 +585,25 @@
       if (j.state === 'error' || j.state === 'cancelled') left.className = 'l err';
       else if (j.state === 'complete') left.className = 'l ok';
       const right = document.createElement('span');
-      if (j.state === 'assembling' && j.total) right.textContent = `${fmtBytes(j.received)} / ${fmtBytes(j.total)} · ${pct}%`;
-      else if (j.state === 'assembling' && j.received) right.textContent = fmtBytes(j.received) + ' · ' + pct + '%';
-      else if (j.state === 'downloading' && j.mode === 'direct' && j.total)
+      if ((j.state === 'assembling' || j.state === 'downloading' || j.state === 'paused') && j.total)
         right.textContent = `${fmtBytes(j.received || 0)} / ${fmtBytes(j.total)} · ${pct}%`;
-      else if (j.state === 'downloading' && j.total) right.textContent = fmtBytes(j.total);
+      else if (j.state === 'assembling' && j.received) right.textContent = fmtBytes(j.received) + ' · ' + pct + '%';
       else if (j.state === 'complete' && j.total) right.textContent = fmtBytes(j.total);
       st.append(left, right);
       row.appendChild(st);
+
+      if (j.fallback) {
+        const fallback = document.createElement('div'); fallback.className = 'qfallback';
+        fallback.textContent = '↪ ' + j.fallback;
+        row.appendChild(fallback);
+      }
+      const detail = document.createElement('div'); detail.className = 'qdetail';
+      const metrics = [];
+      if (j.state === 'paused') metrics.push('Paused — resume when ready');
+      else if (j.speed > 0 && (j.state === 'downloading' || j.state === 'assembling')) metrics.push(fmtRate(j.speed));
+      if (j.etaSeconds != null && j.state !== 'paused') metrics.push('ETA ' + fmtEta(j.etaSeconds));
+      detail.textContent = metrics.join(' · ');
+      row.appendChild(detail);
 
       el.queueList.appendChild(row);
     }
@@ -475,8 +659,10 @@
           if (j.part != null) state.part = j.part;
           if (j.partsTotal != null) state.partsTotal = j.partsTotal;
           const s = state.jobState;
-          if (j.state === 'assembling' && (s === 'working' || s === 'idle')) state.jobState = 'assembling';
-          else if (j.state === 'downloading' && s !== 'downloading') state.jobState = 'downloading';
+          if (j.state === 'queued' && !['complete', 'error', 'cancelled'].includes(s)) state.jobState = 'queued';
+          else if (j.state === 'working' && !['complete', 'error', 'cancelled'].includes(s)) state.jobState = 'working';
+          else if (j.state === 'assembling' && !['complete', 'error', 'cancelled'].includes(s)) state.jobState = 'assembling';
+          else if ((j.state === 'downloading' || j.state === 'paused') && !['complete', 'error', 'cancelled'].includes(s)) state.jobState = j.state;
           else if (j.state === 'error') state.jobState = 'error';
           else if (j.state === 'complete') state.jobState = 'complete';
           else if (j.state === 'cancelled') state.jobState = 'cancelled';
@@ -487,7 +673,7 @@
       for (const id of Object.keys(state.queue)) if (!seen.has(id)) delete state.queue[id];
       renderQueue();
     }
-    const busy = ['working', 'assembling', 'downloading'].includes(state.jobState);
+    const busy = QUEUE_RUNNING.has(state.jobState) || state.jobState === 'paused' || state.jobState === 'queued';
     if (state.panelOpen || busy) pollTimer = setTimeout(pollQueue, 1000);
   }
   function kickPoll() {
@@ -507,10 +693,14 @@
     if (!format) return;
     const jobId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
     state.jobId = jobId;
-    state.jobState = 'working';
+    state.jobState = 'queued';
     state.received = 0; state.total = null; state.progress = null; state.error = null; state.part = null; state.partsTotal = null;
+    if (state.settings.rememberQuality !== false) {
+      state.settings.lastQualityKey = qualityKey(format);
+      persistSettings();
+    }
     // Optimistic queue entry (the SW's queue poll completes it with quality).
-    state.queue[jobId] = { jobId, title: state.info.title || 'Video', quality: qualityLabel(format), state: 'working', received: 0, total: null, progress: null };
+    state.queue[jobId] = { jobId, title: state.info.title || 'Video', quality: qualityLabel(format), state: 'queued', received: 0, total: null, progress: null };
     state.queueOpen = true;
     el.dlBtn.disabled = true;
     renderJob();
@@ -522,6 +712,7 @@
         pageUrl: location.href, host,
         template: state.settings.filenameTemplate,
         saveAs: state.settings.saveAs !== false,
+        notify: state.settings.notifications !== false,
         title: state.info.title || 'video',
         id: (location.search.match(/viewkey=([\w]+)/) || [])[1] || '',
       });
@@ -554,12 +745,23 @@
     if (state.jobId) cancelJobById(state.jobId);
   }
 
+  async function togglePauseJob(job) {
+    if (!job || job.mode !== 'direct' || !['downloading', 'paused'].includes(job.state)) return;
+    const type = job.state === 'paused' ? MSG.RESUME : MSG.PAUSE;
+    const res = await send({ type, jobId: job.jobId }).catch((e) => ({ ok: false, error: e.message }));
+    if (!res?.ok) {
+      job.error = res?.error || 'Could not change download state';
+      renderQueue();
+    }
+    kickPoll();
+  }
+
   // Queue management (queue rows, any job — including jobs from other tabs).
 
   async function restartJobById(jobId) {
     const q = state.queue[jobId];
     if (q) {
-      q.state = 'working'; q.error = null; q.received = 0; q.progress = null; q.part = null; q.partsTotal = null;
+      q.state = 'queued'; q.error = null; q.received = 0; q.progress = null; q.part = null; q.partsTotal = null; q.paused = false; q.speed = 0; q.etaSeconds = null;
       renderQueue();
     }
     try {
@@ -757,6 +959,10 @@
           part: msg.part != null ? msg.part : prev.part,
           partsTotal: msg.partsTotal != null ? msg.partsTotal : prev.partsTotal,
           mode: msg.mode != null ? msg.mode : prev.mode,
+          paused: msg.paused != null ? !!msg.paused : !!prev.paused,
+          speed: msg.speed != null ? msg.speed : (prev.speed || 0),
+          etaSeconds: msg.etaSeconds != null ? msg.etaSeconds : prev.etaSeconds,
+          fallback: msg.fallback != null ? msg.fallback : prev.fallback,
         };
         renderQueue();
         kickPoll(); // reconcile full details (quality label) shortly
@@ -768,8 +974,8 @@
         if (msg.error) state.error = msg.error;
         if (msg.part != null) state.part = msg.part;
         if (msg.partsTotal != null) state.partsTotal = msg.partsTotal;
-        if (msg.event === 'progress' && (state.jobState === 'idle' || state.jobState === 'working')) {
-          state.jobState = msg.state === 'assembling' ? 'assembling' : 'downloading';
+        if (msg.event === 'progress' && !['complete', 'error', 'cancelled'].includes(state.jobState)) {
+          state.jobState = msg.state === 'queued' ? 'queued' : msg.state === 'working' ? 'working' : msg.state === 'assembling' ? 'assembling' : msg.state === 'paused' ? 'paused' : 'downloading';
           if (msg.jobId === state.jobId) syncDownloadBtn();
         } else if (msg.event === 'complete') state.jobState = 'complete';
         else if (msg.event === 'error') state.jobState = 'error';
@@ -781,6 +987,8 @@
       }
     } else if (msg.type === 'PHD:TOGGLE_PANEL') {
       setPanelOpen(!state.panelOpen);
+    } else if (msg.type === 'PHD:SHOW_PANEL') {
+      setPanelOpen(true);
     }
   });
 
@@ -804,6 +1012,8 @@
       const s = await chrome.storage.sync.get(Object.keys(state.settings));
       Object.assign(state.settings, s);
     } catch { /* defaults */ }
+    state.settings.maxParallel = Number.isInteger(Number(state.settings.maxParallel)) && Number(state.settings.maxParallel) >= 0
+      ? Number(state.settings.maxParallel) : 3;
     if (!isVideoPage) return;
     buildUI();
     setPanelOpen(!!state.settings.autoShowPanel);

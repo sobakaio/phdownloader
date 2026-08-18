@@ -17,6 +17,8 @@ const MSG = {
   GET_INFO: 'PHD:GET_INFO',
   DOWNLOAD: 'PHD:DOWNLOAD',
   CANCEL: 'PHD:CANCEL',
+  PAUSE: 'PHD:PAUSE',
+  RESUME: 'PHD:RESUME',
   SET_HOST: 'PHD:SET_HOST',
   GET_STATE: 'PHD:GET_STATE',
   GET_QUEUE: 'PHD:GET_QUEUE',
@@ -29,6 +31,38 @@ const MSG = {
 
 const jobs = new Map(); // jobId -> job (active + terminal queue entries)
 const downloadJobs = new Map(); // chrome.downloads item id -> job
+const DEFAULT_MAX_PARALLEL = 3;
+let maxParallel = DEFAULT_MAX_PARALLEL; // 0 = unlimited
+function normalizeMaxParallel(value) {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 && n <= 4 ? n : DEFAULT_MAX_PARALLEL;
+}
+function slotState(state) {
+  return state === 'working' || state === 'assembling' || state === 'downloading' || state === 'paused';
+}
+function activeSlotCount() {
+  let n = 0;
+  for (const j of jobs.values()) if (slotState(j.state)) n++;
+  return n;
+}
+async function waitForSlot(job) {
+  while (!job.cancelled && maxParallel > 0 && activeSlotCount() >= maxParallel) {
+    if (job.state !== 'queued') {
+      job.state = 'queued';
+      broadcastEvent(job, 'progress');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  if (job.cancelled) throw new Error('Cancelled by user');
+  job.state = 'working';
+  broadcastEvent(job, 'progress');
+}
+async function loadConcurrencySettings() {
+  try { maxParallel = normalizeMaxParallel((await chrome.storage.sync.get('maxParallel')).maxParallel); } catch { /* defaults */ }
+}
+chrome.storage?.onChanged?.addListener((changes, area) => {
+  if (area === 'sync' && changes.maxParallel) maxParallel = normalizeMaxParallel(changes.maxParallel.newValue);
+});
 
 // Terminal queue entries (complete/error/cancelled) stay in the panel's queue
 // so the user can restart or remove them, then are purged.
@@ -57,13 +91,15 @@ function jobToRecord(j) {
     blobUrl: j.blobUrl || null, blobSize: j.blobSize || null, tabId: j.tabId != null ? j.tabId : null,
     saveName: j.saveName || null, error: j.error || null,
     part: j.part || null, partsTotal: j.partsTotal || null, mode: j.mode || null,
+    paused: !!j.paused, speed: j.speed || 0, etaSeconds: j.etaSeconds ?? null,
+    fallback: j.fallback || null, notify: j.notify !== false,
   };
 }
 async function persistJobs() {
   const data = {};
   const term = [];
   for (const [id, j] of jobs) {
-    if (j.state === 'working' || j.state === 'assembling' || j.state === 'downloading') {
+    if (j.state === 'queued' || j.state === 'working' || j.state === 'assembling' || j.state === 'downloading' || j.state === 'paused') {
       data[id] = jobToRecord(j);
     } else if (TERMINAL_STATES.has(j.state)) {
       term.push([id, j]);
@@ -88,6 +124,22 @@ function scheduleTerminalPurge(job) {
     }
   }, ms);
 }
+async function resumeRestoredQueuedJob(job) {
+  if (jobs.get(job.jobId) !== job || job.state !== 'queued') return;
+  jobs.delete(job.jobId);
+  try {
+    const res = await handleDownload({
+      jobId: job.jobId, format: job.format, pageUrl: job.pageUrl, host: job.host,
+      template: job.template, title: job.title, id: job.videoId, saveAs: job.saveAs,
+      notify: job.notify, tabId: job.tabId,
+    }, null);
+    if (!res?.ok) throw new Error(res?.error || 'Queued download could not be resumed');
+  } catch (e) {
+    job.state = 'error'; job.error = e.message || String(e); jobs.set(job.jobId, job);
+    broadcastEvent(job, 'error'); notifyJob(job, 'error'); scheduleRelease(job);
+  }
+}
+
 async function restoreJobs() {
   try {
     const data = (await chrome.storage.session.get(JOBS_KEY))[JOBS_KEY] || {};
@@ -103,9 +155,15 @@ async function restoreJobs() {
         n++;
         continue;
       }
+      if (j.state === 'queued') {
+        const restored = { ...j, cancelled: false };
+        jobs.set(id, restored); n++;
+        setTimeout(() => resumeRestoredQueuedJob(restored), 0);
+        continue;
+      }
       jobs.set(id, { ...j, cancelled: false });
       if (j.downloadId != null) downloadJobs.set(j.downloadId, jobs.get(id));
-      if (j.state === 'downloading' && j.downloadId != null) {
+      if ((j.state === 'downloading' || j.state === 'paused') && j.downloadId != null) {
         const jj = jobs.get(id);
         jj.downloadPoll = setInterval(() => reconcileDownload(jj), 2000);
       }
@@ -180,8 +238,38 @@ async function ensureOffscreen() {
   }
   throw new Error('offscreen media document did not become ready');
 }
-const VERSION = '1.4.6';
+const VERSION = '1.5.0';
 console.log(`phpd: service worker started (v${VERSION})`);
+
+const CONTEXT_MENU_ID = 'phpd-open-panel';
+function setupContextMenu() {
+  if (!chrome.contextMenus?.removeAll) return;
+  chrome.contextMenus.removeAll(() => {
+    try {
+      chrome.contextMenus.create({
+        id: CONTEXT_MENU_ID,
+        title: 'Download with PHDownloader',
+        contexts: ['page'],
+        documentUrlPatterns: [
+          'https://*.pornhubpremium.com/view_video.php*', 'https://*.pornhubpremium.com/video/show*',
+          'https://*.pornhubpremium.com/embed/*', 'https://*.pornhub.com/view_video.php*',
+          'https://*.pornhub.com/video/show*', 'https://*.pornhub.com/embed/*',
+        ],
+      });
+    } catch { /* menu may already exist during a reload */ }
+  });
+}
+setupContextMenu();
+chrome.runtime.onInstalled?.addListener(setupContextMenu);
+chrome.contextMenus?.onClicked?.addListener((info, tab) => {
+  if (info.menuItemId !== CONTEXT_MENU_ID || tab?.id == null) return;
+  chrome.tabs.sendMessage(tab.id, { type: 'PHD:SHOW_PANEL' }).catch(async () => {
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+      await chrome.tabs.sendMessage(tab.id, { type: 'PHD:SHOW_PANEL' });
+    } catch { /* page is no longer injectable */ }
+  });
+});
 
 // ---------------------------------------------------------------- utilities
 
@@ -469,10 +557,12 @@ async function refreshFormat(pageUrl, host, wanted, tabId = null) {
 }
 
 function failJob(job, message) {
+  if (TERMINAL_STATES.has(job.state)) return;
   console.error('phpd: job ' + job.jobId + ' FAILED: ' + message);
   job.state = 'error';
   job.error = message;
   broadcastEvent(job, 'error');
+  notifyJob(job, 'error');
   scheduleRelease(job);
 }
 
@@ -481,6 +571,7 @@ function failJob(job, message) {
 // re-fetch the page once and re-issue the download with a fresh URL.
 const RETRYABLE_DL_ERRORS = new Set([
   'FILE_NOT_AVAILABLE', 'SERVER_HTTP_ERROR', 'SERVER_BUSY', 'NETWORK_CHANGED', 'NETWORK_TIMEOUT',
+  'NETWORK_FAILED', 'NETWORK_DISCONNECTED', 'SERVER_FAILED', 'SERVER_NO_RANGE', 'NETWORK_INVALID_REQUEST',
 ]);
 
 async function retryDirectAfterInterrupt(job, reason) {
@@ -522,8 +613,10 @@ async function handleDownload(msg, sender) {
   // The container (and thus the extension) is only known once the manifest is
   // resolved, so the filename is built lazily via makeSave().
   const job = {
-    jobId, state: 'working', cancelled: false,
-    received: 0, total: null, error: null,
+    jobId, state: 'queued', cancelled: false,
+    received: 0, total: null, error: null, paused: false,
+    speed: 0, etaSeconds: null, metricReceived: 0, metricAt: 0,
+    fallback: null,
     downloadId: null, blobUrl: null,
     title: title || 'video', ext: 'mp4',
     // retry context: expired-token recovery for direct CDN downloads
@@ -532,6 +625,7 @@ async function handleDownload(msg, sender) {
     videoId: id || '', retryDone: false, tabId,
     // 'Ask where to save' setting (panel checkbox, default ON).
     saveAs: saveAsIn !== false,
+    notify: msg.notify !== false,
     createdAt: Date.now(),
   };
   // One active job per video: a duplicate start (double-click, or the same
@@ -540,11 +634,12 @@ async function handleDownload(msg, sender) {
   const dedupId = id || '';
   for (const j of jobs.values()) {
     if (dedupId && j.videoId === dedupId &&
-        (j.state === 'working' || j.state === 'assembling' || j.state === 'downloading')) {
+        (j.state === 'queued' || j.state === 'working' || j.state === 'assembling' || j.state === 'downloading' || j.state === 'paused')) {
       return { ok: false, error: 'This video is already being downloaded' };
     }
   }
   jobs.set(jobId, job);
+  schedulePersist();
 
   const makeSave = (ext) => buildFilename(template, { title, quality: qualityToken(format), id }, ext);
 
@@ -720,9 +815,11 @@ async function handleDownload(msg, sender) {
       job.saveName = name;
       job.ext = ext;
       job.mode = 'direct';      // the browser fetches the CDN itself -> real progress
+      job.paused = false;
       job.state = 'downloading';
       job.received = 0;
       job.total = null;
+      job.speed = 0; job.etaSeconds = null; job.metricReceived = 0; job.metricAt = 0;
       ensureKeepAlive();
       console.log('phpd: direct CDN download as', name, '(saveAs=' + job.saveAs + ')');
       job.downloadId = await chrome.downloads.download({
@@ -790,8 +887,14 @@ async function handleDownload(msg, sender) {
       && (f.height === format0.height || f.quality === format0.height || f.quality === format0.quality));
     if (!hls) throw new Error(`CDN rejected the direct link (${reason}) and no HLS variant of ${format0.height || format0.quality}p is available`);
     console.log('phpd: direct link rejected by CDN — falling back to HLS ' + (hls.height || hls.quality));
+    job.fallback = 'Direct MP4 failed → HLS fallback';
+    job.format = hls;
+    job.mode = 'assemble';
     job.received = 0;
+    job.total = null;
+    job.speed = 0; job.etaSeconds = null; job.metricReceived = 0; job.metricAt = 0;
     job.blobUrl = null; // previous offscreen blob (if any) is released via PHD:OFF_RELEASE
+    broadcastEvent(job, 'progress');
     return run(hls);
   };
 
@@ -799,6 +902,7 @@ async function handleDownload(msg, sender) {
   // status, re-fetch the page once (fresh token) and retry the same format.
   let refreshed = false;
   try {
+    await waitForSlot(job);
     const vt = tokenValidTo(format.url);
     if (pageUrl && vt && Date.now() / 1000 > vt - 120) {
       console.log('phpd: link token expired/expiring — refreshing page for a new token');
@@ -862,6 +966,8 @@ async function handleDownload(msg, sender) {
     job.state = 'error';
     job.error = e.message || String(e);
     broadcastEvent(job, 'error');
+    notifyJob(job, 'error');
+    scheduleRelease(job);
     return { ok: false, error: job.error };
   }
 }
@@ -907,6 +1013,26 @@ async function saveBlobForJob(job, size) {
   return issueSave(job, size);
 }
 
+function updateDownloadMetrics(job, received) {
+  const now = Date.now();
+  if (!Number.isFinite(received) || received < 0) return;
+  if (job.metricAt && received >= job.metricReceived && now > job.metricAt) {
+    const dt = (now - job.metricAt) / 1000;
+    const delta = received - job.metricReceived;
+    if (dt >= 0.25 && delta > 0) {
+      const sample = delta / dt;
+      job.speed = job.speed ? job.speed * 0.7 + sample * 0.3 : sample;
+    }
+  } else if (received < job.metricReceived) {
+    job.speed = 0;
+    job.etaSeconds = null;
+  }
+  job.metricReceived = received;
+  job.metricAt = now;
+  job.etaSeconds = job.total && job.speed > 0 && received < job.total
+    ? Math.max(0, (job.total - received) / job.speed) : null;
+}
+
 function sendProgress(job) {
   broadcastEvent(job, 'progress');
 }
@@ -927,10 +1053,34 @@ function broadcastEvent(job, event) {
     part: job.part || null,
     partsTotal: job.partsTotal || null,
     mode: job.mode || null,
+    paused: !!job.paused,
+    speed: job.speed || 0,
+    etaSeconds: job.etaSeconds ?? null,
+    fallback: job.fallback || null,
   });
 }
 
 // ------------------------------------------------------ job lifecycle
+
+function notifyJob(job, kind) {
+  if (job.notify === false || !chrome.notifications?.create) return;
+  const title = kind === 'complete' ? 'Download complete' : 'Download failed';
+  const message = kind === 'complete'
+    ? `${job.title || 'Video'}${job.fallback ? ' (HLS fallback)' : ''}`
+    : (job.error || `${job.title || 'Video'} could not be downloaded`);
+  try {
+    chrome.notifications.create('phpd-' + job.jobId, {
+      type: 'basic', iconUrl: 'icons/icon128.png', title: 'PHDownloader · ' + title, message,
+    }).catch(() => {});
+  } catch { /* notifications may be unavailable or denied */ }
+}
+
+chrome.notifications?.onClicked?.addListener(async (notificationId) => {
+  if (!notificationId.startsWith('phpd-')) return;
+  const job = jobs.get(notificationId.slice(5));
+  if (job?.tabId == null) return;
+  try { await chrome.tabs.update(job.tabId, { active: true }); } catch { /* tab was closed */ }
+});
 
 function ensureKeepAlive() {
   // 24 s period: must stay BELOW the 30 s service-worker idle timeout.
@@ -955,14 +1105,14 @@ async function releaseJob(job) {
   // The job entry itself stays in the queue (the user can restart or remove
   // it); it is purged once it has aged out.
   scheduleTerminalPurge(job);
-  if (![...jobs.values()].some((j) => j.state === 'assembling' || j.state === 'downloading')) {
+  if (![...jobs.values()].some((j) => slotState(j.state) || j.state === 'queued')) {
     await chrome.alarms.clear('phpd-keepalive');
   }
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'phpd-keepalive') {
-    if (![...jobs.values()].some((j) => j.state === 'assembling' || j.state === 'downloading')) {
+    if (![...jobs.values()].some((j) => slotState(j.state) || j.state === 'queued')) {
       chrome.alarms.clear('phpd-keepalive');
     }
   } else if (alarm.name.startsWith('phpd-stuck-')) {
@@ -977,6 +1127,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // Terminal handling for a download item, shared by the onChanged event and
 // the reconciler (the blob-download 'complete' event can be lost).
 function handleDownloadTerminal(job, st, error, fileSize) {
+  if (TERMINAL_STATES.has(job.state)) return;
   if (job.downloadPoll) { clearInterval(job.downloadPoll); job.downloadPoll = null; }
   if (st === 'complete') {
     const size = fileSize != null ? fileSize : (job.total || job.received || null);
@@ -988,11 +1139,13 @@ function handleDownloadTerminal(job, st, error, fileSize) {
       job.state = 'error';
       job.error = `The CDN saved an error page instead of video (file is only ${sizeTxt}). Delete the file, press Refresh (↻) and retry.`;
       broadcastEvent(job, 'error');
+      notifyJob(job, 'error');
       scheduleRelease(job);
     } else {
       console.log('phpd: download complete — ' + (size != null ? size + 'B' : '?'));
       job.state = 'complete';
       broadcastEvent(job, 'complete');
+      notifyJob(job, 'complete');
       scheduleRelease(job);
     }
   } else if (job.cancelled) {
@@ -1013,7 +1166,8 @@ function handleDownloadTerminal(job, st, error, fileSize) {
   } else { // interrupted
     const canRetry = job.pageUrl && job.format?.kind === 'direct'
       && RETRYABLE_DL_ERRORS.has(error);
-    if (canRetry && !job.retryDone) {
+    const canRetryBlobSave = job.mode === 'blob' && job.blobUrl && job.blobSize && RETRYABLE_DL_ERRORS.has(error);
+    if ((canRetry || canRetryBlobSave) && !job.retryDone) {
       // First strike: re-issue the direct download with a fresh token.
       job.retryDone = true;
       job.state = 'working';
@@ -1034,6 +1188,7 @@ function handleDownloadTerminal(job, st, error, fileSize) {
       job.state = 'error';
       job.error = error || 'Download interrupted';
       broadcastEvent(job, 'error');
+      notifyJob(job, 'error');
       scheduleRelease(job);
     }
   }
@@ -1053,13 +1208,15 @@ async function reconcileDownload(job) {
     // bytesReceived is the live counter used by Chrome's Download Manager.
     const oldReceived = job.received;
     const oldTotal = job.total;
+    const oldPaused = !!job.paused;
     if (item.totalBytes > 0) job.total = item.totalBytes;
-    // Blob saves have no useful streaming progress; direct CDN items do.
-    // Keep the fallback for a restored/legacy job whose mode is absent.
-    if (job.mode !== 'blob' && Number.isFinite(item.bytesReceived) && item.bytesReceived >= 0) {
+    job.paused = !!item.paused;
+    if (!job.paused && job.mode !== 'blob' && Number.isFinite(item.bytesReceived) && item.bytesReceived >= 0) {
+      updateDownloadMetrics(job, item.bytesReceived);
       job.received = item.bytesReceived;
     }
-    if (job.received !== oldReceived || job.total !== oldTotal) sendProgress(job);
+    job.state = job.paused ? 'paused' : 'downloading';
+    if (job.received !== oldReceived || job.total !== oldTotal || job.paused !== oldPaused) sendProgress(job);
     return;
   }
   if (item.state === 'complete' || item.state === 'interrupted') {
@@ -1101,11 +1258,15 @@ chrome.downloads.onChanged.addListener((delta) => {
   const st = delta.state?.state || null;
   if (job) {
     if (st === 'in_progress') {
-      job.state = 'downloading';
-      if (delta.bytesReceived != null) job.received = delta.bytesReceived;
+      if (delta.paused?.paused != null) job.paused = !!delta.paused.paused;
+      job.state = job.paused ? 'paused' : 'downloading';
       if (delta.totalBytes != null) job.total = delta.totalBytes;
       else if (delta.progress?.progress != null && delta.bytesReceived != null) {
         job.total = Math.round(delta.bytesReceived / Math.max(0.01, delta.progress.progress));
+      }
+      if (!job.paused && delta.bytesReceived != null && job.mode !== 'blob') {
+        updateDownloadMetrics(job, delta.bytesReceived);
+        job.received = delta.bytesReceived;
       }
       sendProgress(job);
     } else if (st === 'complete' || st === 'interrupted') {
@@ -1135,6 +1296,11 @@ function queueSnapshot() {
     part: j.part || null,
     partsTotal: j.partsTotal || null,
     mode: j.mode || null,
+    paused: !!j.paused,
+    speed: j.speed || 0,
+    etaSeconds: j.etaSeconds ?? null,
+    fallback: j.fallback || null,
+    downloadId: j.downloadId != null ? j.downloadId : null,
     error: j.error || null,
     tabId: j.tabId != null ? j.tabId : null,
     createdAt: j.createdAt || null,
@@ -1255,6 +1421,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case MSG.DOWNLOAD:
           return await handleDownload(msg, sender);
+        case MSG.PAUSE:
+        case MSG.RESUME: {
+          const job = jobs.get(msg.jobId);
+          if (!job || job.mode !== 'direct' || job.downloadId == null) {
+            return { ok: false, error: 'Only active direct MP4 downloads can be paused' };
+          }
+          const pausing = msg.type === MSG.PAUSE;
+          try {
+            if (pausing) await chrome.downloads.pause(job.downloadId);
+            else await chrome.downloads.resume(job.downloadId);
+          } catch (e) {
+            return { ok: false, error: (e && e.message) || 'Chrome could not change the download state' };
+          }
+          job.paused = pausing;
+          job.state = pausing ? 'paused' : 'downloading';
+          sendProgress(job);
+          return { ok: true, paused: pausing };
+        }
         case MSG.CANCEL: {
           const job = jobs.get(msg.jobId);
           if (job) {
@@ -1262,7 +1446,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (job.tabId != null) {
               try { chrome.tabs.sendMessage(job.tabId, { type: 'PHD:PAGE_CANCEL', jobId: job.jobId }).catch(() => {}); } catch { /* tab gone */ }
             }
-            if (job.state === 'assembling' || job.state === 'working') {
+            if (job.state === 'queued' || job.state === 'assembling' || job.state === 'working') {
               job.state = 'cancelled';
               job.error = 'Cancelled by user.';
               broadcastEvent(job, 'cancelled');
@@ -1306,4 +1490,5 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 
 // Re-adopt active jobs after a service-worker restart.
+loadConcurrencySettings();
 restoreJobs();

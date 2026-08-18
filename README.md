@@ -33,13 +33,18 @@ media bytes → a local file.
 
 Queue management (per row / bulk):
 
+- Direct MP4 rows show live **speed** and **ETA**; the **Ⅱ / ▶** control pauses
+  and resumes them through Chrome's download service.
 - **✕** on an active row cancels that download.
 - **↻** on a *cancelled* row restarts that download from the beginning.
 - **✕** on a finished / failed / cancelled row removes that row from the queue.
+- Search and the **All / Active / Done / Errors** filter narrow the queue without
+  deleting hidden rows. The queue grows to the viewport and then scrolls inside.
 - **Clear finished** removes all non-active rows at once; active downloads
   keep running. Finished rows auto-purge after an hour if left alone.
 
-Status: `Assembling… X / ~Y (N%)` → `Saving file… writing to disk (size)` → `✔ Done`.
+Status: `Queued` → `Assembling… X / ~Y (N%)` → `Downloading… size · speed · ETA`
+→ `✔ Done`. Direct failures explicitly show `Direct MP4 failed → HLS fallback`.
 
 **⚙ Settings** (in the panel, persisted per profile):
 
@@ -57,6 +62,14 @@ Status: `Assembling… X / ~Y (N%)` → `Saving file… writing to disk (size)` 
 - *Hide HLS streams* — unchecked (default): show HLS fallback qualities in the
   picker. Check it to hide them; direct MP4 and DASH entries remain visible.
   Automatic HLS fallback is still available if a direct link fails.
+- *Remember last quality* and *Quality profile* — remember a specific quality,
+  or always choose the highest available, highest direct MP4, or highest HLS.
+- *Desktop notifications* — notify on completion or failure; clicking a
+  notification returns to the source video tab.
+- *Maximum parallel downloads* — choose 1–4 or Unlimited (default: 3).
+
+You can also right-click a PH video page and choose **Download with PHDownloader**
+to open the panel.
 
 ## Files and formats
 
