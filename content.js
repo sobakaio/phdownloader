@@ -290,7 +290,7 @@
     switch (j.state) {
       case 'working': return 'Starting…';
       case 'assembling': return j.partsTotal ? `Assembling ${j.part || 0}/${j.partsTotal}` : 'Assembling…';
-      case 'downloading': return 'Saving file…';
+      case 'downloading': return j.mode === 'direct' ? 'Downloading…' : 'Saving file…';
       case 'complete': return '✔ Done';
       case 'error': return '✖ ' + (j.error || 'Error');
       case 'cancelled': return 'Cancelled';
@@ -336,7 +336,10 @@
       const bw = document.createElement('div'); bw.className = 'qbarwrap';
       const bar = document.createElement('div'); bar.className = 'qbar';
       let pct = j.progress != null ? Math.round(j.progress * 100) : 0;
-      if (j.state === 'downloading' || j.state === 'complete') pct = 100;
+      // Blob -> disk copies report no progress (the browser doesn't track
+      // blob saves), so they show full-width; direct CDN downloads stream
+      // real per-second progress (reconcileDownload mirrors fileSize/total).
+      if (j.state === 'complete' || (j.state === 'downloading' && j.mode !== 'direct')) pct = 100;
       if (j.state === 'error' || j.state === 'cancelled') pct = j.progress != null ? Math.round(j.progress * 100) : 0;
       bar.style.width = pct + '%';
       bw.appendChild(bar);
@@ -350,6 +353,8 @@
       const right = document.createElement('span');
       if (j.state === 'assembling' && j.total) right.textContent = `${fmtBytes(j.received)} / ${fmtBytes(j.total)} · ${pct}%`;
       else if (j.state === 'assembling' && j.received) right.textContent = fmtBytes(j.received) + ' · ' + pct + '%';
+      else if (j.state === 'downloading' && j.mode === 'direct' && j.total)
+        right.textContent = `${fmtBytes(j.received || 0)} / ${fmtBytes(j.total)} · ${pct}%`;
       else if (j.state === 'downloading' && j.total) right.textContent = fmtBytes(j.total);
       else if (j.state === 'complete' && j.total) right.textContent = fmtBytes(j.total);
       st.append(left, right);
@@ -683,6 +688,7 @@
           error: msg.error || prev.error,
           part: msg.part != null ? msg.part : prev.part,
           partsTotal: msg.partsTotal != null ? msg.partsTotal : prev.partsTotal,
+          mode: msg.mode != null ? msg.mode : prev.mode,
         };
         renderQueue();
         kickPoll(); // reconcile full details (quality label) shortly

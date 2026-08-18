@@ -56,7 +56,7 @@ function jobToRecord(j) {
     retryDone: !!j.retryDone, downloadId: j.downloadId != null ? j.downloadId : null,
     blobUrl: j.blobUrl || null, blobSize: j.blobSize || null, tabId: j.tabId != null ? j.tabId : null,
     saveName: j.saveName || null, error: j.error || null,
-    part: j.part || null, partsTotal: j.partsTotal || null,
+    part: j.part || null, partsTotal: j.partsTotal || null, mode: j.mode || null,
   };
 }
 async function persistJobs() {
@@ -180,7 +180,7 @@ async function ensureOffscreen() {
   }
   throw new Error('offscreen media document did not become ready');
 }
-const VERSION = '1.4.1';
+const VERSION = '1.4.2';
 console.log(`phpd: service worker started (v${VERSION})`);
 
 // ---------------------------------------------------------------- utilities
@@ -719,6 +719,7 @@ async function handleDownload(msg, sender) {
       const name = job.saveName || makeSave(ext);
       job.saveName = name;
       job.ext = ext;
+      job.mode = 'direct';      // the browser fetches the CDN itself -> real progress
       job.state = 'downloading';
       job.received = 0;
       job.total = null;
@@ -883,6 +884,7 @@ async function handleDownload(msg, sender) {
 // ---------------------------------------------------------------------------
 async function issueSave(job, size) {
   const name = job.saveName;
+  job.mode = 'blob';        // blob -> disk copy: the browser reports no progress
   job.state = 'downloading';
   // The bytes already exist in the blob; the save phase is a local disk copy.
   job.received = 0;
@@ -924,6 +926,7 @@ function broadcastEvent(job, event) {
     title: job.title,
     part: job.part || null,
     partsTotal: job.partsTotal || null,
+    mode: job.mode || null,
   });
 }
 
