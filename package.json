@@ -1,6 +1,6 @@
 {
   "name": "phdownloader",
-  "version": "1.2.3",
+  "version": "1.5.4",
   "private": true,
   "description": "Chrome MV3 extension: download premium PH videos. This package only carries the Node unit-test tooling for the lib/ parsers.",
   "type": "module",

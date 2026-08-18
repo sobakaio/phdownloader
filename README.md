@@ -71,6 +71,15 @@ Status: `Queued` → `Assembling… X / ~Y (N%)` → `Downloading… size · spe
 You can also right-click a PH video page and choose **Download with PHDownloader**
 to open the panel.
 
+## License and legal notice
+
+The source code is released under the [MIT License](LICENSE). This license
+covers only the PHDownloader source code; it does not grant rights to any
+videos, website content, PH/Pornhub trademarks, accounts, or services. PHDownloader
+is an independent project and is not affiliated with or endorsed by Pornhub.
+Use it only with content you are authorized to access and save, and follow the
+applicable website terms and copyright laws.
+
 ## Files and formats
 
 | Source      | Output | Notes                                             |

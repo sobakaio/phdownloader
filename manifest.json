@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PHDownloader",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "Download premium PH videos while logged in — quality picker (720p and up, sorted by resolution) and the native Save-as dialog.",
   "minimum_chrome_version": "116",
   "permissions": [

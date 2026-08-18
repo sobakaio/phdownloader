@@ -238,7 +238,7 @@ async function ensureOffscreen() {
   }
   throw new Error('offscreen media document did not become ready');
 }
-const VERSION = '1.5.3';
+const VERSION = '1.5.4';
 console.log(`phpd: service worker started (v${VERSION})`);
 
 const CONTEXT_MENU_ID = 'phpd-open-panel';
