@@ -318,6 +318,7 @@
     el.rememberQualityChk.addEventListener('change', () => {
       state.settings.rememberQuality = el.rememberQualityChk.checked;
       persistSettings();
+      renderInfo();
     });
     el.notificationsChk.addEventListener('change', () => {
       state.settings.notifications = el.notificationsChk.checked;
@@ -377,6 +378,20 @@
     return [f.kind, f.height ?? '', f.quality ?? '', f.width ?? '', f.bitrateK ?? '', f.trackId ?? '', f.container ?? ''].join('|');
   }
 
+  function resolutionRank(f) {
+    if (!f || f.kind === 'mpd-audio') return 0;
+    return Number(f.height || f.quality || f.width || f.bandwidth || f.bitrateK || 0) || 0;
+  }
+
+  function formatKindRank(f) {
+    return ({ direct: 0, hls: 1, mpd: 2, 'mpd-audio': 3 }[f?.kind] ?? 9);
+  }
+
+  function compareFormats(a, b) {
+    const resolution = resolutionRank(b.f) - resolutionRank(a.f);
+    return resolution || formatKindRank(a.f) - formatKindRank(b.f);
+  }
+
   function selectedFormat() {
     if (!state.info?.formats || !el.quality) return null;
     const index = Number(el.quality.value);
@@ -415,7 +430,8 @@
     }
     el.titleEl.textContent = info.title || 'Video';
     const visible = info.formats.map((f, index) => ({ f, index }))
-      .filter(({ f }) => !state.settings.hideHls || f.kind !== 'hls');
+      .filter(({ f }) => !state.settings.hideHls || f.kind !== 'hls')
+      .sort(compareFormats);
     const hiddenHls = info.formats.length - visible.length;
     el.meta.textContent = [info.duration ? fmtDur(info.duration) : null,
       `${visible.length} formats${hiddenHls ? ` · ${hiddenHls} HLS hidden` : ''}`,
@@ -432,7 +448,7 @@
       else { bits.push('MP4 direct'); if (f.bitrateK) bits.push(`${f.bitrateK} kbps`); }
       const srcTag = f.source && !['get_media', 'mediaDefinitions'].includes(f.source) ? ` (${f.source})` : '';
       const deadTag = f.kind === 'direct' && f.available === false ? ' · (probe failed)' : '';
-      opt.textContent = bits.filter(Boolean).join(' · ') + srcTag + deadTag + (f.recommended ? '   ★ recommended' : '');
+      opt.textContent = bits.filter(Boolean).join(' · ') + srcTag + deadTag;
       el.quality.appendChild(opt);
     }
     if (!visible.length && info.formats.length) {
@@ -445,20 +461,20 @@
     // Choose the remembered quality or the selected quality profile.
     const remembered = state.settings.rememberQuality !== false
       ? visible.find(({ f }) => qualityKey(f) === state.settings.lastQualityKey) : null;
-    const rank = ({ f }) => Number(f.height || f.width || f.bandwidth || f.bitrateK || 0);
-    const direct = visible.filter(({ f }) => f.kind === 'direct' && f.available !== false).sort((a, b) => rank(b) - rank(a));
-    const hls = visible.filter(({ f }) => f.kind === 'hls').sort((a, b) => rank(b) - rank(a));
-    const highest = visible.slice().sort((a, b) => rank(b) - rank(a));
-    const rec = visible.find(({ f }) => f.recommended);
+    const direct = visible.filter(({ f }) => f.kind === 'direct' && f.available !== false);
+    const hls = visible.filter(({ f }) => f.kind === 'hls');
+    const usable = visible.filter(({ f }) => f.kind !== 'direct' || f.available !== false);
+    const highestAvailable = usable[0] || visible[0];
     const profile = state.settings.qualityProfile || 'remembered';
-    const preferred = profile === 'highest-direct' ? direct[0]
-      : profile === 'highest-hls' ? hls[0]
-      : profile === 'highest' ? highest[0]
-      : null;
-    if (remembered && profile === 'remembered') el.quality.value = String(remembered.index);
+    const preferred = profile === 'highest-direct' ? (direct[0] || highestAvailable)
+      : profile === 'highest-hls' ? (hls[0] || highestAvailable)
+      : profile === 'highest' ? highestAvailable
+      : direct[0] || highestAvailable;
+    // The checkbox gates remembered-quality selection. Explicit profiles always
+    // win; with Remember last quality off, the remembered profile falls back to
+    // the highest usable direct format (then the first visible format).
+    if (remembered && state.settings.rememberQuality !== false && profile === 'remembered') el.quality.value = String(remembered.index);
     else if (preferred) el.quality.value = String(preferred.index);
-    else if (rec) el.quality.value = String(rec.index);
-    else if (visible.length) el.quality.value = String(visible[0].index);
     updateFilenamePreview();
     syncDownloadBtn();
   }

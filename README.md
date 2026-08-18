@@ -24,7 +24,7 @@ media bytes → a local file.
 
 1. Open a premium video page.
 2. The **⬇ Download video** chip appears (top right). Click it for the panel.
-3. Pick a quality — the highest direct MP4 is preselected (★).
+3. Pick a quality — the available formats are listed from highest to lowest resolution.
 4. Click **Download** and choose the save location in the native dialog.
 5. To download more videos, open their pages in other tabs and press
    **Download** there — both run in parallel. The panel's **⬇ Queue** section

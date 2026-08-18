@@ -356,10 +356,6 @@ function dedupeAndRank(formats) {
   const rank = (f) => ({ direct: 0, hls: 1, mpd: 2, 'mpd-audio': 3 }[f.kind] ?? 9) * 1e12 -
     ((f.height || f.bandwidth || 0));
   out.sort((a, b) => rank(a) - rank(b));
-  if (out.length) {
-    const best = out.find((f) => f.kind === 'direct') || out[0];
-    best.recommended = true;
-  }
   return out;
 }
 
@@ -472,12 +468,6 @@ async function expandCandidates(page, host = activeHost, tabId = null) {
     return prio * 1e12 - ((f.height || f.bandwidth || 0));
   };
   deduped.sort((a, b) => rank2(a) - rank2(b));
-  for (const f of deduped) f.recommended = false;
-  const best = deduped.find((f) => f.kind === 'direct' && f.available === true)
-    || deduped.find((f) => f.kind === 'direct' && f.available == null)
-    || deduped.find((f) => f.kind !== 'direct')
-    || deduped[0];
-  if (best) best.recommended = true;
   return { formats: deduped, notes };
 }
 
