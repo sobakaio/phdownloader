@@ -238,7 +238,7 @@ async function ensureOffscreen() {
   }
   throw new Error('offscreen media document did not become ready');
 }
-const VERSION = '1.5.1';
+const VERSION = '1.5.3';
 console.log(`phpd: service worker started (v${VERSION})`);
 
 const CONTEXT_MENU_ID = 'phpd-open-panel';
@@ -1063,6 +1063,7 @@ function broadcastEvent(job, event) {
     error: job.error,
     title: job.title,
     videoId: job.videoId || null,
+    pageUrl: job.pageUrl || null,
     part: job.part || null,
     partsTotal: job.partsTotal || null,
     mode: job.mode || null,
@@ -1301,6 +1302,7 @@ function queueSnapshot() {
   return [...jobs.values()].map((j) => ({
     jobId: j.jobId,
     videoId: j.videoId || null,
+    pageUrl: j.pageUrl || null,
     title: j.title,
     quality: qualityToken(j.format),
     ext: j.ext,

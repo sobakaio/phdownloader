@@ -490,19 +490,49 @@
   // comes back — a long or stuck save must not disable it forever.
   // Double-starts of the same video are rejected by the SW (one active job
   // per videoId), so re-enabling early is safe.
+  function extractVideoId(urlLike) {
+    try {
+      const u = new URL(urlLike, location.href);
+      const viewkey = u.searchParams.get('viewkey');
+      if (viewkey) return viewkey;
+      const match = u.pathname.match(/\/(?:embed|video(?:\/show)?)\/([^/?#]+)/i);
+      return match ? decodeURIComponent(match[1]) : '';
+    } catch { return ''; }
+  }
+
   function currentVideoId() {
-    return (location.search.match(/viewkey=([\w]+)/) || [])[1] || '';
+    return extractVideoId(location.href);
+  }
+
+  function pageIdentity(urlLike) {
+    try {
+      const u = new URL(urlLike, location.href);
+      const id = extractVideoId(u.href);
+      return id ? `video:${id}` : `page:${u.origin}${u.pathname}`;
+    } catch { return ''; }
+  }
+
+  function queueJobMatchesPage(job) {
+    const id = currentVideoId();
+    if (id && job.videoId && job.videoId === id) return true;
+    return !!(job.pageUrl && pageIdentity(job.pageUrl) === pageIdentity(location.href));
+  }
+
+  function queueStatePriority(job) {
+    if (['queued', 'working', 'assembling', 'downloading'].includes(job.state)) return 0;
+    if (job.state === 'paused') return 1;
+    if (job.state === 'cancelled') return 2;
+    if (job.state === 'error') return 3;
+    if (job.state === 'complete') return 4;
+    return 5;
   }
 
   function currentQueueJob() {
-    const id = currentVideoId();
-    if (state.jobId && state.queue[state.jobId]) {
-      const local = state.queue[state.jobId];
-      if (!local.videoId || !id || local.videoId === id) return local;
-    }
-
-    if (!id) return null;
-    return Object.values(state.queue).find((j) => j.videoId === id) || null;
+    const matches = Object.values(state.queue).filter(queueJobMatchesPage);
+    matches.sort((a, b) => queueStatePriority(a) - queueStatePriority(b)
+      || (a.jobId === state.jobId ? -1 : b.jobId === state.jobId ? 1 : 0)
+      || (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0));
+    return matches[0] || null;
   }
 
   function syncDownloadBtn() {
@@ -780,7 +810,7 @@
       persistSettings();
     }
     // Optimistic queue entry (the SW's queue poll completes it with quality).
-    state.queue[jobId] = { jobId, videoId: currentVideoId(), title: state.info.title || 'Video', quality: qualityLabel(format), state: 'queued', received: 0, total: null, progress: null };
+    state.queue[jobId] = { jobId, videoId: currentVideoId(), pageUrl: location.href, title: state.info.title || 'Video', quality: qualityLabel(format), state: 'queued', received: 0, total: null, progress: null };
     state.queueOpen = true;
     syncDownloadBtn();
     renderJob();
@@ -1058,6 +1088,7 @@
           ...prev,
           jobId: msg.jobId,
           videoId: msg.videoId != null ? msg.videoId : prev.videoId,
+          pageUrl: msg.pageUrl != null ? msg.pageUrl : prev.pageUrl,
           title: msg.title || prev.title || 'Video',
           state: msg.state,
           received: typeof msg.received === 'number' ? msg.received : prev.received,
